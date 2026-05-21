@@ -1,0 +1,776 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Double Inverted Pendulum</title>
+    <style>
+        body {
+            margin: 0; background-color: #0f111a; color: #fff;
+            font-family: 'Segoe UI', system-ui, sans-serif; display: flex;
+            padding: 15px; gap: 15px; box-sizing: border-box; height: 100vh; overflow: hidden;
+        }
+        #plots-panel { width: 90px; display: flex; flex-direction: column; gap: 3px; height: 100%; flex-shrink: 0; }
+        #plots-panel canvas { display: block; width: 100%; flex: 1; background: #1a1c23; border-radius: 6px; border: 1px solid #282a36; }
+        #left-panel { flex: 1; display: flex; flex-direction: column; gap: 6px; height: 100%; }
+        #right-panel {
+            width: 380px; background-color: #1a1c23; padding: 10px 15px;
+            border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); overflow-y: auto; height: 100%; box-sizing: border-box;
+        }
+        .canvas-container { background-color: #05070f; border-radius: 12px; overflow: hidden; border: 1px solid #282a36; flex: 1; position: relative; cursor: crosshair; }
+        #simCanvas { display: block; width: 100%; height: 100%; }
+        h3 { margin: 0 0 6px 0; color: #00ecb3; border-bottom: 1px solid #282a36; padding-bottom: 4px; font-weight: 600; font-size: 14px; }
+        .control-group { margin-bottom: 4px; }
+        .control-group label { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 1px; color: #a9b2c3; }
+        .control-group input[type="range"] { width: 100%; accent-color: #00ecb3; background: #282a36; margin: 2px 0; }
+        .btn-row { display: flex; gap: 6px; margin-bottom: 6px; }
+        button { flex: 1; padding: 6px; font-size: 11px; font-weight: bold; cursor: pointer; background: #282a36; color: white; border: 1px solid #444; border-radius: 6px; transition: all 0.15s ease; }
+        button:hover { background: #3b3f54; border-color: #00ecb3; }
+        #btnShock { background: #ff5555; border-color: #ff6e6e; }
+        
+        .tel-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px; }
+        .tel-box { background: #222430; padding: 6px; border-radius: 8px; border-left: 4px solid #ffb86c; }
+        .tel-box.adaptive { border-left-color: #00ecb3; }
+        .tel-label { font-size: 10px; color: #6272a4; text-transform: uppercase; letter-spacing: 0.5px; }
+        .tel-val { font-size: 12px; font-weight: bold; font-family: monospace; margin-top: 1px; color: #f8f8f2; }
+        .hint { font-size: 10px; color: #ffb86c; margin-bottom: 4px; font-style: italic; }
+    </style>
+</head>
+<body>
+
+    <div id="plots-panel">
+        <canvas id="plotTh1"></canvas>
+        <canvas id="plotTh2"></canvas>
+        <canvas id="plotForce"></canvas>
+        <canvas id="plotPos"></canvas>
+        <canvas id="plotEpot"></canvas>
+        <canvas id="plotEkin"></canvas>
+    </div>
+    <div id="left-panel">
+        <div class="canvas-container" id="canvasWrapper">
+            <canvas id="simCanvas"></canvas>
+        </div>
+    </div>
+
+    <div id="right-panel">
+        <h3>System Supervision</h3>
+        <p class="hint">💡 Use your mouse wheel inside the animation area to zoom (10% - 300%). Click on the track to request a position target.</p>
+        
+        <div class="tel-grid">
+            <div class="tel-box adaptive">
+                <div class="tel-label">Cart Position (Actual)</div>
+                <div class="tel-val" id="lblXAct">0.00 m</div>
+            </div>
+            <div class="tel-box">
+                <div class="tel-label">Zoom Scale</div>
+                <div class="tel-val" id="lblZoom">100 %</div>
+            </div>
+            <div class="tel-box">
+                <div class="tel-label">Position Target</div>
+                <div class="tel-val" id="lblXSet">0.00 m</div>
+            </div>
+            <div class="tel-box">
+                <div class="tel-label">System State</div>
+                <div class="tel-val" id="lblSysState">0</div>
+            </div>
+            <div class="tel-box">
+                <div class="tel-label">Solver State</div>
+                <div class="tel-val" id="lblSolverState">—</div>
+            </div>
+        </div>
+
+        <h3>Interaction Mode</h3>
+        <div class="btn-row">
+            <button id="btnPower" style="background:#444; color:white;">Power: OFF</button>
+            <button id="btnRailLimits" style="background:#00ecb3; color:#0f111a;">Limits: ON</button>
+        </div>
+        <h3>Target Angle States</h3>
+        <div class="tel-grid">
+            <button onclick="setTargetState(0, 0)">0, 0</button>
+            <button onclick="setTargetState(0, Math.PI)">0, π</button>
+            <button onclick="setTargetState(Math.PI, 0)">π, 0</button>
+            <button onclick="setTargetState(Math.PI, Math.PI)">π, π</button>
+        </div>
+        <div class="control-group">
+            <label>Initial Scenario</label>
+            <select id="scenarioSelector" style="width: 100%; padding: 5px; background: #282a36; color: white; border: 1px solid #444; border-radius: 6px;">
+                <option value="A">Scenario A: Upright Stabilization</option>
+                <option value="B">Scenario B: Uncontrolled Free Fall</option>
+                <option value="C">Scenario C: Swing-Up Control</option>
+            </select>
+        </div>
+        <div class="btn-row">
+            <button id="btnAdaptiveToggle" style="background:#00ecb3; color:#0f111a;">Adaptation: ON</button>
+        </div>
+        <div class="btn-row">
+            <button id="btnReset">Reset State</button>
+            <button id="btnShock">Shock Test</button>
+            <button id="btnDownloadCsv">Download CSV</button>
+        </div>
+
+        <h3>Live Physical Parameters</h3>
+        <div class="control-group">
+            <label>Cart Mass (M): <span id="valM">1.50</span> kg</label>
+            <input type="range" id="slipM" min="0.5" max="5.0" step="0.1" value="1.5">
+        </div>
+        <div class="control-group">
+            <label>Joint Friction (Damping): <span id="valC">0.00</span> Nms/rad</label>
+            <input type="range" id="slipC" min="0.00" max="0.50" step="0.01" value="0.00">
+        </div>
+        <div class="control-group">
+            <label>Link 2 Mass (Top Weight): <span id="valM2">0.50</span> kg</label>
+            <input type="range" id="slipM2" min="0.05" max="3.50" step="0.05" value="0.50">
+        </div>
+        <div class="control-group">
+            <label>Link 2 Length: <span id="valL2">0.20</span> m</label>
+            <input type="range" id="slipL2" min="0.10" max="1.00" step="0.05" value="0.20">
+        </div>
+        <div class="control-group">
+            <label>Link 1 Mass: <span id="valM1">0.50</span> kg</label>
+            <input type="range" id="slipM1" min="0.05" max="2.00" step="0.05" value="0.50">
+        </div>
+        <div class="control-group">
+            <label>Link 1 Length: <span id="valL1">0.20</span> m</label>
+            <input type="range" id="slipL1" min="0.10" max="1.00" step="0.05" value="0.20">
+        </div>
+        <div class="control-group">
+            <label>Local Gravity (g): <span id="valG">9.81</span> m/s²</label>
+            <input type="range" id="slipG" min="1.0" max="35.0" step="0.2" value="9.81">
+        </div>
+
+    </div>
+
+<script>
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d');
+const plotCtxs = ['plotTh1','plotTh2','plotForce','plotPos','plotEpot','plotEkin'].map(id => {
+    const el = document.getElementById(id);
+    el.ctx = el.getContext('2d');
+    return el;
+});
+
+function resizeCanvas() {
+    if (!canvas.parentElement) return;
+    canvas.width = canvas.parentElement.clientWidth;
+    canvas.height = canvas.parentElement.clientHeight;
+    for (const el of plotCtxs) {
+        const r = el.getBoundingClientRect();
+        el.width = Math.round(r.width);
+        el.height = Math.round(r.height);
+    }
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// Physical Parameters (Updated to specification)
+let M = 1.5, m1 = 0.5, m2 = 0.50;
+let L1 = 0.4, L2 = 0.4;
+let l1 = 0.2, l2 = 0.2;
+let I1 = 0.0104;
+let I2;
+let g = 9.81, c_damping = 0.0;
+let adaptiveMode = true;
+let K = [31.62, 294.52, -532.74, -41.45, -57.51, -102.32];
+let K_static = [...K];
+
+I2 = (1/12) * m2 * (0.02 + 4 * l2 * l2);
+
+// State Vector Initialization: [x, dx, th1, dth1, th2, dth2]
+let state = [0.0, 0.0, Math.PI, 0.0, Math.PI, 0.0]; 
+let x_soll = 0.0; 
+const BASE_METER_TO_PIXEL = 140;
+let zoomScale = 1.0; 
+
+// LQR Gain synthesis: pole-placement-style gains scaled by mass matrix
+function synthesizeLQR() {
+    I1 = (1/12) * m1 * (0.02 + 4 * l1 * l1);
+    I2 = (1/12) * m2 * (0.02 + 4 * l2 * l2);
+
+    const Mm11 = M + m1 + m2;
+    const Mm12 = m1 * l1 + m2 * L1;
+    const Mm13 = m2 * l2;
+    const Mm22 = I1 + m1 * l1 * l1 + m2 * L1 * L1;
+    const Mm23 = m2 * L1 * l2;
+    const Mm33 = I2 + m2 * l2 * l2;
+
+    const det = Mm11*(Mm22*Mm33 - Mm23*Mm23) - Mm12*(Mm12*Mm33 - Mm23*Mm13) + Mm13*(Mm12*Mm23 - Mm22*Mm13);
+    const mi00 = (Mm22*Mm33 - Mm23*Mm23) / det;
+    const mi10 = (Mm23*Mm13 - Mm12*Mm33) / det;
+    const mi20 = (Mm12*Mm23 - Mm22*Mm13) / det;
+
+    const b0 = mi00;
+    const b1 = mi10;
+    const b2 = mi20;
+
+    const scale = Mm11 / (2.25);
+    const kx = 5 * scale;
+    const kdx = 15 * scale;
+    const kth1 = 120 * scale;
+    const kdth1 = 30 * scale;
+    const kth2 = 80 * scale;
+    const kdth2 = 20 * scale;
+
+    K = [kx, kdx, -kth1, -kdth1, -kth2, -kdth2];
+    K = K.map(v => Math.max(-800, Math.min(800, v)));
+    K_static = [...K];
+}
+
+
+
+function equationsOfMotion(x_vec, u) {
+    const [x, dx, th1, dth1, th2, dth2] = x_vec;
+    const s1 = Math.sin(th1), c1 = Math.cos(th1), s2 = Math.sin(th2), c2 = Math.cos(th2);
+    const s12 = Math.sin(th1 - th2), c12 = Math.cos(th1 - th2);
+
+    // Inertia Matrix M(q)
+    const M11 = M + m1 + m2;
+    const M12 = (m1 * l1 + m2 * L1) * c1;
+    const M13 = m2 * l2 * c2;
+    const M21 = M12;
+    const M22 = I1 + m1 * l1**2 + m2 * L1**2;
+    const M23 = m2 * L1 * l2 * c12;
+    const M31 = M13;
+    const M32 = M23;
+    const M33 = I2 + m2 * l2**2;
+
+    const M_mat = [[M11, M12, M13], [M21, M22, M23], [M31, M32, M33]];
+
+    // Coriolis Matrix C(q, q')
+    const C_mat = [
+        [0, -(m1 * l1 + m2 * L1) * dth1 * s1, -m2 * l2 * dth2 * s2],
+        [0, 0, m2 * L1 * l2 * dth2 * s12],
+        [0, -m2 * L1 * l2 * dth1 * s12, 0]
+    ];
+
+    // Gravity Vector G(q)
+    const G = [0, -(m1 * l1 + m2 * L1) * g * s1, -m2 * g * l2 * s2];
+
+    // Input Mapping H
+    const H = [u, 0, 0];
+
+    // Solve M * q'' = H - C * q' - G
+    // C * q'
+    const Cq_dot = [
+        C_mat[0][0]*dx + C_mat[0][1]*dth1 + C_mat[0][2]*dth2,
+        C_mat[1][0]*dx + C_mat[1][1]*dth1 + C_mat[1][2]*dth2,
+        C_mat[2][0]*dx + C_mat[2][1]*dth1 + C_mat[2][2]*dth2
+    ];
+
+    const rhs = [
+        H[0] - Cq_dot[0] - G[0],
+        H[1] - Cq_dot[1] - G[1] - c_damping * dth1,
+        H[2] - Cq_dot[2] - G[2] - c_damping * dth2
+    ];
+
+    // Simple inversion for 3x3 matrix M
+    const det = M11 * (M22 * M33 - M32 * M23) - M12 * (M21 * M33 - M31 * M23) + M13 * (M21 * M32 - M31 * M22);
+    const invM = [
+        [(M22 * M33 - M23 * M32) / det, (M13 * M32 - M12 * M33) / det, (M12 * M23 - M13 * M22) / det],
+        [(M23 * M31 - M21 * M33) / det, (M11 * M33 - M13 * M31) / det, (M13 * M21 - M11 * M23) / det],
+        [(M21 * M32 - M22 * M31) / det, (M12 * M31 - M11 * M32) / det, (M11 * M22 - M12 * M21) / det]
+    ];
+
+    const ddx = invM[0][0] * rhs[0] + invM[0][1] * rhs[1] + invM[0][2] * rhs[2];
+    const ddth1 = invM[1][0] * rhs[0] + invM[1][1] * rhs[1] + invM[1][2] * rhs[2];
+    const ddth2 = invM[2][0] * rhs[0] + invM[2][1] * rhs[1] + invM[2][2] * rhs[2];
+
+    return [dx, ddx, dth1, ddth1, dth2, ddth2];
+}
+
+// Partial Feedback Linearization: compute u that achieves desired cart acceleration v
+// M(q)·q̈ + C·q̇ + G = H·u  → solve for u given ẍ = v
+function pflForce(v, x, dx, th1, dth1, th2, dth2) {
+    const s1 = Math.sin(th1), c1 = Math.cos(th1), s2 = Math.sin(th2), c2 = Math.cos(th2);
+    const s12 = Math.sin(th1 - th2), c12 = Math.cos(th1 - th2);
+    const M11 = M + m1 + m2;
+    const M12 = (m1 * l1 + m2 * L1) * c1;
+    const M13 = m2 * l2 * c2;
+    const M21 = M12, M22 = I1 + m1 * l1**2 + m2 * L1**2, M23 = m2 * L1 * l2 * c12;
+    const M31 = M13, M32 = M23, M33 = I2 + m2 * l2**2;
+
+    const C1 = -(m1 * l1 + m2 * L1) * dth1 * s1 - m2 * l2 * dth2 * s2;
+    const C2 = m2 * L1 * l2 * dth2 * s12;
+    const C3 = -m2 * L1 * l2 * dth1 * s12;
+    const G1 = 0, G2 = -(m1 * l1 + m2 * L1) * g * s1, G3 = -m2 * g * l2 * s2;
+
+    // Pendulum subsystem inertia (2x2)
+    const detP = M22 * M33 - M23 * M32;
+    // θ̈ components without v
+    const th1ddP = (M33 * (-C2 - G2 - c_damping * dth1) - M23 * (-C3 - G3 - c_damping * dth2)) / detP;
+    const th2ddP = (-M32 * (-C2 - G2 - c_damping * dth1) + M22 * (-C3 - G3 - c_damping * dth2)) / detP;
+    // θ̈ per unit v
+    const th1ddV = (-M33 * M21 + M23 * M31) / detP;
+    const th2ddV = (M32 * M21 - M22 * M31) / detP;
+
+    // u = M11·v + M12·(th1ddP + th1ddV·v) + M13·(th2ddP + th2ddV·v) + C1 + G1
+    const alpha = M11 + M12 * th1ddV + M13 * th2ddV;
+    const phi = M12 * th1ddP + M13 * th2ddP + C1 + G1;
+    return alpha * v + phi;
+}
+
+// Classical Runge-Kutta 4 Integrator Step Loop 
+function rk4Step(dt, u) {
+    let k1 = equationsOfMotion(state, u);
+    let s2 = []; for(let i=0; i<6; i++) s2[i] = state[i] + 0.5 * dt * k1[i];
+    let k2 = equationsOfMotion(s2, u);
+    let s3 = []; for(let i=0; i<6; i++) s3[i] = state[i] + 0.5 * dt * k2[i];
+    let k3 = equationsOfMotion(s3, u);
+    let s4 = []; for(let i=0; i<6; i++) s4[i] = state[i] + dt * k3[i];
+    let k4 = equationsOfMotion(s4, u);
+    for(let i=0; i<6; i++) state[i] += (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+}
+
+
+
+
+
+// Main Window Renderer Loop Canvas Draws
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const OX = canvas.width / 2, OY = canvas.height / 2 + 50;
+    const currentMeterToPixel = BASE_METER_TO_PIXEL * zoomScale;
+
+    // Linear Rail Track Line Profile
+    ctx.strokeStyle = '#2d3142'; ctx.lineWidth = 12; ctx.beginPath(); ctx.moveTo(OX - 2.5*currentMeterToPixel, OY+15); ctx.lineTo(OX + 2.5*currentMeterToPixel, OY+15); ctx.stroke();
+    ctx.strokeStyle = '#4f5d75'; ctx.lineWidth = 4; ctx.beginPath(); ctx.moveTo(0, OY); ctx.lineTo(canvas.width, OY); ctx.stroke();
+    
+    // Centimeter Rail Axis Scale Text Labels
+    ctx.fillStyle = '#6272a4'; ctx.strokeStyle = '#4f5d75'; ctx.lineWidth = 1; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+    let step = zoomScale < 0.4 ? 50 : 10;
+    for (let cm = -250; cm <= 250; cm += step) {
+        let m = cm / 100; let tickX = OX + m * currentMeterToPixel;
+        if (cm % 50 === 0) {
+            ctx.beginPath(); ctx.moveTo(tickX, OY + 15); ctx.lineTo(tickX, OY + 27); ctx.stroke();
+            let label = m > 0 ? "+" + m.toFixed(1) + "m" : m.toFixed(1) + "m";
+            if(cm === 0) label = "0.0m";
+            ctx.fillText(label, tickX, OY + 39);
+        } else {
+            ctx.beginPath(); ctx.moveTo(tickX, OY + 15); ctx.lineTo(tickX, OY + 21); ctx.stroke();
+        }
+    }
+    
+    // Physical End Buffers Stop Boundaries
+    ctx.fillStyle = '#ff5555'; ctx.fillRect(OX - 2.52*currentMeterToPixel - 6, OY - 15, 6, 30); ctx.fillRect(OX + 2.52*currentMeterToPixel, OY - 15, 6, 30);
+    
+    // Orange Target Reference Demands
+    const xt = OX + x_soll * currentMeterToPixel;
+    ctx.strokeStyle = 'rgba(255, 159, 67, 0.4)'; ctx.lineWidth = 2; ctx.setLineDash([]); ctx.beginPath(); ctx.moveTo(xt, OY-180 * zoomScale); ctx.lineTo(xt, OY+25); ctx.stroke();
+
+    // Transform coordinate mappings
+    const xc = OX + state[0] * currentMeterToPixel;
+    const x1 = xc + (l1*2)*currentMeterToPixel*Math.sin(state[2]), y1 = OY - (l1*2)*currentMeterToPixel*Math.cos(state[2]);
+    const x2 = x1 + (l2*2)*currentMeterToPixel*Math.sin(state[4]), y2 = y1 - (l2*2)*currentMeterToPixel*Math.cos(state[4]);
+
+    const wheelRadius = 10 * Math.min(1.5, Math.max(0.6, zoomScale)); 
+    const wheelOffset = 28 * zoomScale;
+    const rotationAngle = (state[0] * currentMeterToPixel) / wheelRadius;
+
+    // Drawing the wheels
+    const drawWheel = (wx, wy) => {
+        ctx.save(); ctx.translate(wx, wy); ctx.rotate(rotationAngle);
+        ctx.fillStyle = '#1e1e24'; ctx.strokeStyle = '#a9b2c3'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(0, 0, wheelRadius, 0, 2*Math.PI); ctx.fill(); ctx.stroke();
+        ctx.strokeStyle = '#ffb86c'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(-wheelRadius, 0); ctx.lineTo(wheelRadius, 0); ctx.stroke();
+        ctx.restore();
+    };
+    drawWheel(xc - wheelOffset, OY + 15 - wheelRadius); drawWheel(xc + wheelOffset, OY + 15 - wheelRadius);
+
+    // Drawing the chassis
+    const cWidth = 84 * zoomScale, cHeight = 22 * zoomScale;
+    ctx.fillStyle = '#00ecb3'; ctx.fillRect(xc - cWidth/2, OY - cHeight, cWidth, cHeight);
+
+    // Drawing joints and links
+    ctx.fillStyle = '#4f5d75'; ctx.beginPath(); ctx.arc(xc, OY - cHeight, 6 * zoomScale, 0, 2*Math.PI); ctx.fill();
+    ctx.strokeStyle = '#00e5ff'; ctx.lineWidth = 6 * Math.sqrt(zoomScale); ctx.beginPath(); ctx.moveTo(xc, OY - cHeight); ctx.lineTo(x1, y1); ctx.stroke();
+    ctx.fillStyle = '#282a36'; ctx.strokeStyle = '#ff007f'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x1, y1, 6 * zoomScale, 0, 2*Math.PI); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle = '#ff007f'; ctx.lineWidth = (4 + (m2 * 1.5)) * Math.sqrt(zoomScale); ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    ctx.fillStyle = '#f1faee'; ctx.beginPath(); ctx.arc(x2, y2, (6 + (m2 * 2)) * zoomScale, 0, 2*Math.PI); ctx.fill();
+    
+    // Schematic Vector Text Overlays
+    if (zoomScale > 0.6) {
+        ctx.fillStyle = '#a9b2c3'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText("M = " + M.toFixed(1) + "kg", xc - 20, OY + 3);
+    }
+}
+
+// --- 6-CHANNEL CIRCULAR BUFFER OSCILLOSCOPE ---
+const maxPoints = 150;
+const history1 = Array(maxPoints).fill(0), history2 = Array(maxPoints).fill(0);
+const history3 = Array(maxPoints).fill(0), history4 = Array(maxPoints).fill(0);
+const history5 = Array(maxPoints).fill(0), history6 = Array(maxPoints).fill(0);
+let bufIdx = 0;
+let lastU = 0; 
+let lastEpot = 0, lastEkin = 0;
+const CSV_MAX = 10000;
+let csvRows = [];
+function resetCsvBuffer() { csvRows = []; }
+
+function normalizeAngle(angle) {
+    return (angle + Math.PI) % (2 * Math.PI) - Math.PI;
+}
+
+function updateChart() {
+    history1[bufIdx] = normalizeAngle(state[2]); // θ1
+    history2[bufIdx] = normalizeAngle(state[4]); // θ2
+    history3[bufIdx] = lastU;    // Input force
+    history4[bufIdx] = state[0]; // Cart position
+    history5[bufIdx] = lastEpot; // Epot
+    history6[bufIdx] = lastEkin; // Ekin
+    bufIdx = (bufIdx + 1) % maxPoints;
+    if (csvRows.length < CSV_MAX) {
+        csvRows.push(state[0].toFixed(6) + ',' + state[1].toFixed(6) + ','
+                   + normalizeAngle(state[2]).toFixed(6) + ',' + state[3].toFixed(6) + ','
+                   + normalizeAngle(state[4]).toFixed(6) + ',' + state[5].toFixed(6) + ','
+                   + lastU.toFixed(4) + ','
+                   + lastEpot.toFixed(6) + ',' + lastEkin.toFixed(6));
+    }
+
+    const plotDefs = [
+        { data: history1, color: '#ff007f', label: 'θ₁ (rad)' },
+        { data: history2, color: '#00ecb3', label: 'θ₂ (rad)' },
+        { data: history3, color: '#f8f8f2', label: 'Force (N)' },
+        { data: history4, color: '#00e5ff', label: 'Pos (m)' },
+        { data: history5, color: '#ff9f43', label: 'Epot (J)' },
+        { data: history6, color: '#8be9fd', label: 'Ekin (J)' },
+    ];
+    for (let pi = 0; pi < plotCtxs.length; pi++) {
+        const el = plotCtxs[pi];
+        const c = el.ctx;
+        const w = el.width, h = el.height;
+        const data = plotDefs[pi].data;
+        let maxVal = 0.1;
+        for (let i = 0; i < maxPoints; i++) {
+            const v = Math.abs(data[(bufIdx + i) % maxPoints]);
+            if (v > maxVal) maxVal = v;
+        }
+        c.clearRect(0, 0, w, h);
+        c.strokeStyle = '#222533'; c.lineWidth = 1;
+        c.beginPath(); c.moveTo(0, h/2); c.lineTo(w, h/2); c.stroke();
+        const scale = maxVal > 0.01 ? (h / 2.3) / maxVal : 1;
+        c.strokeStyle = plotDefs[pi].color; c.lineWidth = 1.5;
+        c.beginPath();
+        for (let i = 0; i < maxPoints; i++) {
+            const idx = (bufIdx + i) % maxPoints;
+            const px = (i / maxPoints) * w;
+            const py = h/2 - data[idx] * scale;
+            if (i === 0) c.moveTo(px, py); else c.lineTo(px, py);
+        }
+        c.stroke();
+        c.fillStyle = '#6272a4'; c.font = '8px monospace'; c.textAlign = 'left';
+        c.fillText(plotDefs[pi].label, 4, 10);
+    }
+}
+
+const dt = 0.0000625; 
+
+
+let halted = false;
+let systemPower = 0; // 0: OFF, 1: ON
+let recoveryState = 0; // 0: LQR/Normal, 1: Stabilization, 2: Swing-up
+let recoveryTimer = 0;
+let mpcDivergedCount = 0;
+let swingTimer = 0;
+let forceLimitEnabled = true;
+let railLimitsEnabled = true;
+
+let lastTimestamp = performance.now();
+
+function loop(timestamp) {
+    const dt_ms = timestamp - lastTimestamp;
+    lastTimestamp = timestamp;
+
+    let timeAccumulator = Math.min(dt_ms / 1000, 0.05); 
+    while (timeAccumulator > 0) {
+        let u = 0;
+
+        if (systemPower === 0) {
+            u = 0;
+        } else if (recoveryState === 1) {
+            recoveryTimer -= dt;
+            const t1 = normalizeAngle(state[2]), dt1 = state[3], dt2 = state[5];
+            const t2 = normalizeAngle(state[4]);
+            const vCenter = -30 * (state[0] - x_soll) - 10 * state[1];
+            const vAngle = 100 * t1 + 80 * t2;
+            const vDamp = -25 * dt1 - 20 * dt2;
+            let vAnti = 0;
+            if (Math.abs(dt2) > 8) vAnti = -1.5 * (dt2 - Math.sign(dt2) * 8);
+            if (Math.abs(dt1) > 7) vAnti += -1.0 * (dt1 - Math.sign(dt1) * 7);
+            const vDesired = Math.max(-15, Math.min(15, vCenter + vAngle + vDamp + vAnti));
+            u = pflForce(vDesired, state[0], state[1], t1, dt1, state[4], dt2);
+            u = Math.max(-50, Math.min(50, u));
+            if (recoveryTimer <= 0) {
+                const ok = Math.abs(normalizeAngle(state[2])) < 0.35 && Math.abs(normalizeAngle(state[4])) < 0.35;
+                if (ok) {
+                    recoveryState = 0;
+                } else {
+                    recoveryState = 2;
+                    recoveryTimer = 30.0;
+                    swingTimer = 0;
+                }
+            }
+        } else {
+            if (recoveryState === 2) {
+                    // ---- Swing-up via Partial Feedback Linearization ----
+                    // Virtual control v = desired cart acceleration drives both pendulums
+                    // through the coupling, enabling active damping of θ₂ spin-out.
+                    const th1 = normalizeAngle(state[2]);
+                    const th2 = normalizeAngle(state[4]);
+                    const dth1 = state[3], dth2 = state[5];
+                    const E1 = 0.5*(I1+m1*l1**2)*dth1**2 + m1*g*l1*(Math.cos(th1)-1);
+                    const E2 = 0.5*(I2+m2*l2**2)*dth2**2 + m2*g*l2*(Math.cos(th2)-1);
+
+                    const pg = Math.min(15, 3 + swingTimer * 0.3);
+                    const cg = Math.max(1, 3 - swingTimer * 0.03);
+
+                    // Acceleration-level swing-up law
+                    const Ew = Math.max(2*E1+0.5*E2, -10);
+                    // Energy pump (only when below target)
+                    const vPump = pg * Math.min(Ew, 0) * dth1 * Math.cos(th1);
+                    // Sinusoidal parametric drive at natural frequency
+                    const omega = Math.sqrt(9.81 / (I1 / (m1 * l1) + l1));
+                    const vSin = Math.min(10, 3 + swingTimer * 0.2) * Math.sin(omega * swingTimer);
+                    // Strong cart centering
+                    const vCart = -cg * (state[0] - x_soll) - cg * 0.3 * state[1];
+                    // PFL enables direct θ₂ velocity damping (thresholded)
+                    let vAnti = 0;
+                    if (Math.abs(dth2) > 8) vAnti = -1.5 * (dth2 - Math.sign(dth2) * 8);
+                    if (Math.abs(dth1) > 7) vAnti += -1.0 * (dth1 - Math.sign(dth1) * 7);
+                    const vDesired = Math.max(-15, Math.min(15, vPump + vSin + vCart + vAnti));
+
+                    u = pflForce(vDesired, state[0], state[1], th1, state[3], th2, state[5]);
+                    u = Math.max(-35, Math.min(35, u));
+
+                    recoveryTimer -= dt;
+                    swingTimer += dt;
+
+                    const absTh1 = Math.abs(th1), absTh2 = Math.abs(th2);
+                    const Et = E1 + E2;
+                    if (absTh1 < 0.55 && absTh2 < 0.75 && Et > -1.5
+                        && Math.abs(dth1) < 5.0 && Math.abs(dth2) < 8.0
+                        && Math.abs(state[0]) < 2.0 && Math.abs(state[1]) < 2.0) {
+                        recoveryState = 1;
+                        recoveryTimer = 5.0;
+                    } else if (recoveryTimer <= 0) {
+                        recoveryState = 2;
+                        recoveryTimer = 30.0;
+                        swingTimer = 0;
+                    }
+                } else if (recoveryState === 0) {
+                    const nt1 = normalizeAngle(state[2]);
+                    const nt2 = normalizeAngle(state[4]);
+                    const th1_a = Math.abs(nt1);
+                    const th2_a = Math.abs(nt2);
+                    if (th1_a < 0.8 && th2_a < 0.8) {
+                        u = -(K[0]*(state[0]-x_soll) + K[1]*state[1] + K[2]*nt1 + K[3]*state[3] + K[4]*nt2 + K[5]*state[5]);
+                        u = Math.max(-50, Math.min(50, u));
+                    } else {
+                        u = 0;
+                    }
+                    if (th1_a > 0.8 || th2_a > 0.8) {
+                        mpcDivergedCount++;
+                        if (mpcDivergedCount > 20) {
+                            recoveryState = 2;
+                            recoveryTimer = 30.0;
+                            mpcDivergedCount = 0;
+                            swingTimer = 0;
+                        }
+                    } else {
+                        mpcDivergedCount = 0;
+                    }
+                }
+            }
+        
+        // Soft rail limit: throttle force when near boundaries (-2.5 to 2.5)
+        if (railLimitsEnabled) {
+            const margin = 0.5; // Distance from limit to start throttling
+            const distToLimit = 2.5 - Math.abs(state[0]);
+            if (distToLimit < margin) {
+                const scale = Math.max(0, distToLimit / margin);
+                // If moving towards the limit, throttle force
+                if ((state[0] > 0 && state[1] > 0) || (state[0] < 0 && state[1] < 0)) {
+                    u *= scale;
+                }
+            }
+        }
+        if (forceLimitEnabled) u = Math.max(-50, Math.min(50, u));
+lastU = u; 
+rk4Step(dt, u);
+lastEpot = m1*g*l1*(Math.cos(state[2])-1) + m2*g*l2*(Math.cos(state[4])-1);
+lastEkin = 0.5*(I1+m1*l1**2)*state[3]**2 + 0.5*(I2+m2*l2**2)*state[5]**2;
+timeAccumulator -= dt;
+}
+
+// Boundary check and rendering logic below...
+        if (railLimitsEnabled && Math.abs(state[0]) > 2.5) { 
+            state[0] = Math.sign(state[0]) * 2.5; state[1] = 0; 
+            if (recoveryState !== 1) {
+                recoveryState = 1;
+                recoveryTimer = 10.0;
+            }
+            }
+draw();
+
+updateChart();
+document.getElementById('lblXAct').innerText = state[0].toFixed(2) + " m";
+const stateLabels = ["Trajectory Playback", "Stabilization", "Swing-up"];
+document.getElementById('lblSysState').innerText = stateLabels[recoveryState]
+    + (recoveryState > 0 ? " (" + (recoveryTimer * 1000).toFixed(0) + " ms)" : "");
+document.getElementById('lblSolverState').innerText =
+    recoveryState === 2 ? "Swing-up " + (recoveryTimer * 1000).toFixed(0) + "ms"
+    : recoveryState === 1 ? "Stabilizing"
+    : recoveryState === 0 ? "LQR" : "—";
+
+    if (!halted && state.some(isNaN)) {
+        halted = true;
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#ff5555';
+        ctx.font = 'bold 28px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('⚠ SIMULATION HALTED', canvas.width/2, canvas.height/2 - 10);
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#ff9f43';
+        ctx.fillText('NaN detected — press Reset', canvas.width/2, canvas.height/2 + 30);
+        return;
+    }
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+
+function resetSystem() {
+    const scenario = document.getElementById('scenarioSelector').value;
+    if (scenario === 'A') {
+        state = [0.0, 0.0, 0.05, 0.0, -0.03, 0.0];
+    } else if (scenario === 'B') {
+        state = [0.0, 0.0, 1.57, 0.0, 0.0, 0.0];
+    } else { // Scenario C
+        state = [0.0, 0.0, 3.1416, 0.0, 3.1416, 0.0];
+    }
+    x_soll = 0.0;
+    halted = false;
+    if (systemPower === 0) {
+        recoveryState = 0;
+    } else {
+        recoveryState = (Math.abs(normalizeAngle(state[2])) < 0.35 && Math.abs(normalizeAngle(state[4])) < 0.35) ? 0 : 2;
+        recoveryTimer = recoveryState === 2 ? 30.0 : 0;
+    }
+    swingTimer = 0;
+    resetCsvBuffer();
+    document.getElementById('lblXSet').innerText = "0.00 m";
+    history1.fill(0); history2.fill(0); history3.fill(0); history4.fill(0); history5.fill(0); history6.fill(0);
+    draw();
+    requestAnimationFrame(loop);
+}
+
+function setTargetState(th1, th2) {
+    state[2] = th1;
+    state[4] = th2;
+    state[1] = 0;
+    state[3] = 0;
+    state[5] = 0;
+    if (systemPower !== 0) {
+        if (Math.abs(normalizeAngle(th1)) < 0.35 && Math.abs(normalizeAngle(th2)) < 0.35) {
+            recoveryState = 0;
+        } else {
+            recoveryState = 2;
+            recoveryTimer = 30.0;
+            swingTimer = 0;
+        }
+    }
+}
+
+// FIXED INITIALIZATION: Wait until everything is completely ready before attaching interaction
+window.addEventListener('DOMContentLoaded', () => {
+    const canvasWrapper = document.getElementById('canvasWrapper');
+
+    // Robust scroll wheel processing
+    canvasWrapper.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        if (e.deltaY < 0) zoomScale += 0.15; else zoomScale -= 0.15;
+        zoomScale = Math.max(0.1, Math.min(3.0, zoomScale));
+        document.getElementById('lblZoom').innerText = Math.round(zoomScale * 100) + " %";
+    }, { passive: false });
+
+    // Click on track to set position target
+    canvasWrapper.addEventListener('click', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const clickX = e.clientX - rect.left;
+        const scaleX = canvas.width / rect.width;
+        const canvasX = clickX * scaleX;
+        const OX = canvas.width / 2;
+        const currentMeterToPixel = BASE_METER_TO_PIXEL * zoomScale;
+        x_soll = (canvasX - OX) / currentMeterToPixel;
+        document.getElementById('lblXSet').innerText = x_soll.toFixed(2) + " m";
+    });
+
+    // Click triggers
+    document.getElementById('btnRailLimits').addEventListener('click', () => { 
+        railLimitsEnabled = !railLimitsEnabled; 
+        document.getElementById('btnRailLimits').style.background = railLimitsEnabled ? "#00ecb3" : "#444";
+        document.getElementById('btnRailLimits').innerText = railLimitsEnabled ? "Limits: ON" : "Limits: OFF";
+    });
+
+    document.getElementById('btnPower').addEventListener('click', () => { 
+        systemPower = systemPower === 1 ? 0 : 1;
+        if (systemPower === 0) {
+            recoveryState = 0;
+            mpcDivergedCount = 0;
+        } else {
+            resetCsvBuffer();
+            if (Math.abs(normalizeAngle(state[2])) < 0.35 && Math.abs(normalizeAngle(state[4])) < 0.35) {
+                recoveryState = 0;
+            } else {
+                recoveryState = 2;
+                recoveryTimer = 30.0;
+                swingTimer = 0;
+            }
+        }
+        document.getElementById('btnPower').style.background = systemPower === 1 ? "#ff5555" : "#444";
+        document.getElementById('btnPower').innerText = systemPower === 1 ? "Power: ON" : "Power: OFF";
+    });
+    document.getElementById('btnAdaptiveToggle').addEventListener('click', () => { 
+        adaptiveMode = !adaptiveMode; 
+        document.getElementById('btnAdaptiveToggle').style.background = adaptiveMode ? "#00ecb3" : "#444";
+        document.getElementById('btnAdaptiveToggle').innerText = adaptiveMode ? "Adaptation: ON" : "Adaptation: OFF";
+        if (!adaptiveMode) K = [...K_static];
+        else synthesizeLQR();
+    });
+
+    document.getElementById('slipC').addEventListener('input', (e) => { c_damping = parseFloat(e.target.value); document.getElementById('valC').innerText = c_damping.toFixed(2); });
+    document.getElementById('slipM').addEventListener('input', (e) => { M = parseFloat(e.target.value); document.getElementById('valM').innerText = M.toFixed(2); synthesizeLQR(); });
+    document.getElementById('slipM2').addEventListener('input', (e) => { m2 = parseFloat(e.target.value); I2 = (1/12)*m2*(0.02+4*l2*l2); document.getElementById('valM2').innerText = m2.toFixed(2); synthesizeLQR(); });
+    document.getElementById('slipL2').addEventListener('input', (e) => { l2 = parseFloat(e.target.value); L2 = l2 * 2; I2 = (1/12)*m2*(0.02+4*l2*l2); document.getElementById('valL2').innerText = l2.toFixed(2); synthesizeLQR(); });
+    document.getElementById('slipM1').addEventListener('input', (e) => { m1 = parseFloat(e.target.value); I1 = (1/12)*m1*(0.02+4*l1*l1); document.getElementById('valM1').innerText = m1.toFixed(2); synthesizeLQR(); });
+    document.getElementById('slipL1').addEventListener('input', (e) => { l1 = parseFloat(e.target.value); L1 = l1 * 2; I1 = (1/12)*m1*(0.02+4*l1*l1); document.getElementById('valL1').innerText = l1.toFixed(2); synthesizeLQR(); });
+    document.getElementById('slipG').addEventListener('input', (e) => { g = parseFloat(e.target.value); document.getElementById('valG').innerText = g.toFixed(2); synthesizeLQR(); });
+
+    document.getElementById('btnShock').addEventListener('click', () => { state[1] += (Math.random()-0.5)*4; state[3] += (Math.random()-0.5)*5; });
+
+    document.getElementById('btnDownloadCsv').addEventListener('click', () => {
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const ts = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate())
+                 + '-' + pad(now.getHours()) + '-' + pad(now.getMinutes()) + '-' + pad(now.getSeconds());
+        let csv = 'time,x,dx,theta1,dtheta1,theta2,dtheta2,force_N,Epot_J,Ekin_J\n';
+        for (let i = 0; i < csvRows.length; i++) {
+            csv += i + ',' + csvRows[i] + '\n';
+        }
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'Pendulum-' + ts + '.csv';
+        document.body.appendChild(a); a.click();
+        document.body.removeChild(a); URL.revokeObjectURL(a.href);
+    });
+    
+    // FIXED: The reset button binding is now clean and operative
+    document.getElementById('btnReset').addEventListener('click', resetSystem);
+
+    // Boot up sequence
+    resizeCanvas();
+    synthesizeLQR();
+    loop();
+});
+</script>
+</body>
+</html>
