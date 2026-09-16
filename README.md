@@ -15,13 +15,17 @@ Open [`index.html`](index.html) in a browser and press **Power**.
 |----------|------|
 | 🇬🇧 English | [README-en.md](README-en.md) |
 | 🇩🇪 Deutsch | [README-de.md](README-de.md) |
+| 🇨🇳 简体中文 | [README-zh.md](README-zh.md) |
 
-Both documents have the same structure and content — the physical model, the
-Riccati solver, the trajectory optimisation, the verified operating range and
-its known limits.
+All three documents have the same structure and content — the physical model,
+the Riccati solver, the trajectory optimisation, the verified operating range
+and its known limits.
 
 ---
 
 *Ein doppeltes invertiertes Pendel auf einem fahrbaren Wagen, aus der hängenden
 Ruhelage aufgeschwungen und in der aufrechten **Up-Up-Lage** gehalten. Die
 deutsche Fassung dieser Dokumentation steht in [README-de.md](README-de.md).*
+
+*小车上的双倒立摆，从自然下垂的状态起摆并保持在竖直的 **up-up 位姿**。
+本文档的中文版见 [README-zh.md](README-zh.md)。*
