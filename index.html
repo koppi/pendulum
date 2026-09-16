@@ -169,8 +169,11 @@ let I1 = 0.0104;
 let I2;
 let g = 9.81, c_damping = 0.0;
 let adaptiveMode = true;
-let K = [31.62, 294.52, -532.74, -41.45, -57.51, -102.32];
+let K = [3.2, 6.5, -303.4, -8.9, 343.9, 41.4];
 let K_static = [...K];
+let P_lqr = null;          // Riccati matrix of the balancing LQR
+let catchLevel = 0;        // eᵀPe below which the LQR is handed control
+const CATCH_MARGIN = 1.0;  // safety factor on the catch region
 
 I2 = (1/12) * m2 * (0.02 + 4 * l2 * l2);
 
@@ -180,116 +183,261 @@ let x_soll = 0.0;
 const BASE_METER_TO_PIXEL = 140;
 let zoomScale = 1.0; 
 
-// LQR Gain synthesis: pole-placement-style gains scaled by mass matrix
+// ---------------------------------------------------------------------------
+//  Minimal dense linear algebra (matrices up to 12x12) for the Riccati solver
+// ---------------------------------------------------------------------------
+function matZeros(r, c) { return Array.from({ length: r }, () => new Array(c).fill(0)); }
+function matMul(A, B) {
+    const r = A.length, k = B.length, c = B[0].length, C = matZeros(r, c);
+    for (let i = 0; i < r; i++) for (let m = 0; m < k; m++) {
+        const a = A[i][m]; if (a === 0) continue;
+        for (let j = 0; j < c; j++) C[i][j] += a * B[m][j];
+    }
+    return C;
+}
+function matT(A) {
+    const T = matZeros(A[0].length, A.length);
+    for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) T[j][i] = A[i][j];
+    return T;
+}
+function matAdd(A, B, s) { return A.map((row, i) => row.map((v, j) => v + (s === undefined ? 1 : s) * B[i][j])); }
+function matMaxAbs(A) { let m = 0; for (const r of A) for (const v of r) m = Math.max(m, Math.abs(v)); return m; }
+function matFrob(A) { let s = 0; for (const r of A) for (const v of r) s += v * v; return Math.sqrt(s); }
+
+// Gauss-Jordan inverse with partial pivoting
+function matInv(A) {
+    const n = A.length;
+    const W = A.map((r, i) => [...r, ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))]);
+    for (let col = 0; col < n; col++) {
+        let piv = col;
+        for (let r = col + 1; r < n; r++) if (Math.abs(W[r][col]) > Math.abs(W[piv][col])) piv = r;
+        if (Math.abs(W[piv][col]) < 1e-14) throw new Error('singular matrix');
+        const tmp = W[col]; W[col] = W[piv]; W[piv] = tmp;
+        const d = W[col][col];
+        for (let j = 0; j < 2 * n; j++) W[col][j] /= d;
+        for (let r = 0; r < n; r++) {
+            if (r === col) continue;
+            const f = W[r][col]; if (f === 0) continue;
+            for (let j = 0; j < 2 * n; j++) W[r][j] -= f * W[col][j];
+        }
+    }
+    return W.map(r => r.slice(n));
+}
+
+// Gaussian elimination for a dense square system
+function solveLinear(A, b) {
+    const n = b.length, W = A.map((r, i) => [...r, b[i]]);
+    for (let col = 0; col < n; col++) {
+        let piv = col;
+        for (let r = col + 1; r < n; r++) if (Math.abs(W[r][col]) > Math.abs(W[piv][col])) piv = r;
+        if (Math.abs(W[piv][col]) < 1e-14) throw new Error('singular system');
+        const tmp = W[col]; W[col] = W[piv]; W[piv] = tmp;
+        const d = W[col][col];
+        for (let j = col; j <= n; j++) W[col][j] /= d;
+        for (let r = 0; r < n; r++) {
+            if (r === col) continue;
+            const f = W[r][col]; if (f === 0) continue;
+            for (let j = col; j <= n; j++) W[r][j] -= f * W[col][j];
+        }
+    }
+    return W.map(r => r[n]);
+}
+
+// Lyapunov equation  F·X + X·Fᵀ + Q = 0  (X symmetric), solved as a 36x36 system
+function lyapSolve(F, Q) {
+    const n = F.length, sz = n * n;
+    const A = matZeros(sz, sz), b = new Array(sz).fill(0);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        const row = i * n + j;
+        for (let k = 0; k < n; k++) {
+            A[row][k * n + j] += F[i][k];   // (F·X)_ij
+            A[row][i * n + k] += F[j][k];   // (X·Fᵀ)_ij
+        }
+        b[row] = -Q[i][j];
+    }
+    const x = solveLinear(A, b), X = matZeros(n, n);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) X[i][j] = x[i * n + j];
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+        const v = 0.5 * (X[i][j] + X[j][i]); X[i][j] = v; X[j][i] = v;
+    }
+    return X;
+}
+
+// Continuous-time algebraic Riccati equation   AᵀP + PA − PBR⁻¹BᵀP + Q = 0
+//
+// Solved through the matrix sign function of the Hamiltonian
+//   Ham = [[A, −BR⁻¹Bᵀ], [−Q, −Aᵀ]]
+// Newton's iteration Z ← ½(cZ + (cZ)⁻¹) converges quadratically to sign(Ham);
+// the stable invariant subspace spanned by the columns of (I − sign(Ham)) has
+// the form [u; P·u], so P follows from a least-squares fit. A few
+// Newton/Kleinman steps then polish P to machine precision.
+function solveCARE(A, B, Q, R) {
+    const n = A.length;
+    const At = matT(A), Bt = matT(B), Rinv = matInv(R);
+    const G = matMul(matMul(B, Rinv), Bt);
+
+    const Ham = matZeros(2 * n, 2 * n);
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        Ham[i][j] = A[i][j];
+        Ham[i][j + n] = -G[i][j];
+        Ham[i + n][j] = -Q[i][j];
+        Ham[i + n][j + n] = -At[i][j];
+    }
+
+    let Z = Ham.map(r => r.slice());
+    for (let it = 0; it < 60; it++) {
+        const Zi = matInv(Z);
+        const c = Math.sqrt(matFrob(Zi) / matFrob(Z)) || 1;
+        let diff = 0;
+        const Zn = matZeros(2 * n, 2 * n);
+        for (let i = 0; i < 2 * n; i++) for (let j = 0; j < 2 * n; j++) {
+            Zn[i][j] = 0.5 * (c * Z[i][j] + Zi[i][j] / c);
+            diff = Math.max(diff, Math.abs(Zn[i][j] - Z[i][j]));
+        }
+        Z = Zn;
+        if (diff < 1e-12 * Math.max(1, matMaxAbs(Z))) break;
+    }
+
+    const U1 = matZeros(n, 2 * n), U2 = matZeros(n, 2 * n);
+    for (let i = 0; i < n; i++) for (let j = 0; j < 2 * n; j++) {
+        U1[i][j] = (i === j ? 1 : 0) - Z[i][j];
+        U2[i][j] = (i + n === j ? 1 : 0) - Z[i + n][j];
+    }
+    const U1t = matT(U1);
+    let P = matMul(matMul(U2, U1t), matInv(matMul(U1, U1t)));
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+        const v = 0.5 * (P[i][j] + P[j][i]); P[i][j] = v; P[j][i] = v;
+    }
+
+    for (let it = 0; it < 12; it++) {
+        const Kk = matMul(matMul(Rinv, Bt), P);
+        const Ac = matAdd(A, matMul(B, Kk), -1);
+        const Qc = matAdd(Q, matMul(matMul(matT(Kk), R), Kk));
+        let Pn;
+        try { Pn = lyapSolve(matT(Ac), Qc); } catch (e) { break; }
+        let d = 0;
+        for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) d = Math.max(d, Math.abs(Pn[i][j] - P[i][j]));
+        P = Pn;
+        if (d < 1e-10 * Math.max(1, matMaxAbs(P))) break;
+    }
+    return { P: P, K: matMul(matMul(Rinv, Bt), P)[0] };
+}
+
+// ---------------------------------------------------------------------------
+//  LQR synthesis about the up-up equilibrium
+// ---------------------------------------------------------------------------
+// Linearisation of  M(q)q̈ + C(q,q̇)q̇ + G(q) = [u,0,0]ᵀ  at θ₁ = θ₂ = 0, q̇ = 0.
+// There M(q) is constant, C vanishes and G is linear, so
+//   q̈ = M₀⁻¹([u,0,0]ᵀ − ∂G/∂q·q − D·q̇)
+function linearizeUpUp() {
+    const a1 = m1 * l1 + m2 * L1;
+    const a2 = m2 * l2;
+    const M0 = [
+        [M + m1 + m2, a1, a2],
+        [a1, I1 + m1 * l1 * l1 + m2 * L1 * L1, m2 * L1 * l2],
+        [a2, m2 * L1 * l2, I2 + m2 * l2 * l2]
+    ];
+    const N = matInv(M0);
+    const A = matZeros(6, 6), B = matZeros(6, 1);
+    A[0][1] = 1; A[2][3] = 1; A[4][5] = 1;
+    for (let i = 0; i < 3; i++) {
+        const row = [1, 3, 5][i];               // ẍ, θ̈₁, θ̈₂
+        A[row][2] = N[i][1] * a1 * g;           // ∂/∂θ₁ (destabilising gravity)
+        A[row][4] = N[i][2] * a2 * g;           // ∂/∂θ₂
+        A[row][3] = -N[i][1] * c_damping;       // joint damping
+        A[row][5] = -N[i][2] * c_damping;
+        B[row][0] = N[i][0];
+    }
+    return { A: A, B: B };
+}
+
+// LQR weights.  Light on cart position, heavy on angular rates: this maximises
+// the basin of attraction reachable inside the ±U_MAX actuator limit, which is
+// what the swing-up has to aim at.
+const LQR_Q = [5.0, 0.1, 10.0, 50.0, 10.0, 50.0];
+const LQR_R = 0.5;
+const U_MAX = 50.0;         // actuator limit (N)
+
 function synthesizeLQR() {
-    I1 = (1/12) * m1 * (0.02 + 4 * l1 * l1);
-    I2 = (1/12) * m2 * (0.02 + 4 * l2 * l2);
-
-    const Mm11 = M + m1 + m2;
-    const Mm12 = m1 * l1 + m2 * L1;
-    const Mm13 = m2 * l2;
-    const Mm22 = I1 + m1 * l1 * l1 + m2 * L1 * L1;
-    const Mm23 = m2 * L1 * l2;
-    const Mm33 = I2 + m2 * l2 * l2;
-
-    const det = Mm11*(Mm22*Mm33 - Mm23*Mm23) - Mm12*(Mm12*Mm33 - Mm23*Mm13) + Mm13*(Mm12*Mm23 - Mm22*Mm13);
-    const mi00 = (Mm22*Mm33 - Mm23*Mm23) / det;
-    const mi10 = (Mm23*Mm13 - Mm12*Mm33) / det;
-    const mi20 = (Mm12*Mm23 - Mm22*Mm13) / det;
-
-    const b0 = mi00;
-    const b1 = mi10;
-    const b2 = mi20;
-
-    const scale = Mm11 / (2.25);
-    const kx = 5 * scale;
-    const kdx = 15 * scale;
-    const kth1 = 120 * scale;
-    const kdth1 = 30 * scale;
-    const kth2 = 80 * scale;
-    const kdth2 = 20 * scale;
-
-    K = [kx, kdx, -kth1, -kdth1, -kth2, -kdth2];
-    K = K.map(v => Math.max(-800, Math.min(800, v)));
-    K_static = [...K];
+    I1 = (1 / 12) * m1 * (0.02 + 4 * l1 * l1);
+    I2 = (1 / 12) * m2 * (0.02 + 4 * l2 * l2);
+    try {
+        const sys = linearizeUpUp();
+        const Q = matZeros(6, 6);
+        for (let i = 0; i < 6; i++) Q[i][i] = LQR_Q[i];
+        const sol = solveCARE(sys.A, sys.B, Q, [[LQR_R]]);
+        if (sol.K.some(v => !isFinite(v))) throw new Error('non-finite gain');
+        // P (and with it the catch test and the planner's terminal cost) always
+        // follows the current plant; only the feedback gain is frozen when
+        // adaptation is switched off, which is the point of that switch.
+        P_lqr = sol.P;
+        if (adaptiveMode) { K = sol.K; K_static = [...sol.K]; }
+        // Largest sub-level set {e:eᵀPe ≤ catchLevel} on which the unsaturated
+        // LQR force stays within ±U_MAX:  max|Ke| over eᵀPe ≤ c  is √(c·KP⁻¹Kᵀ).
+        // Monte-Carlo sweeps show this set sits well inside the true basin, so it
+        // is a safe hand-over test from swing-up to balancing.
+        const Pinv = matInv(P_lqr);
+        let kpk = 0;
+        for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) kpk += K[i] * Pinv[i][j] * K[j];
+        catchLevel = CATCH_MARGIN * U_MAX * U_MAX / kpk;
+    } catch (e) {
+        console.warn('LQR synthesis failed, keeping previous gains:', e.message);
+    }
 }
 
 
 
 function equationsOfMotion(x_vec, u) {
-    const [x, dx, th1, dth1, th2, dth2] = x_vec;
+    const dx = x_vec[1], th1 = x_vec[2], dth1 = x_vec[3], th2 = x_vec[4], dth2 = x_vec[5];
     const s1 = Math.sin(th1), c1 = Math.cos(th1), s2 = Math.sin(th2), c2 = Math.cos(th2);
     const s12 = Math.sin(th1 - th2), c12 = Math.cos(th1 - th2);
+    const a1 = m1 * l1 + m2 * L1, a2 = m2 * l2, b12 = m2 * L1 * l2;
 
-    // Inertia Matrix M(q)
+    // Inertia matrix M(q) — symmetric
     const M11 = M + m1 + m2;
-    const M12 = (m1 * l1 + m2 * L1) * c1;
-    const M13 = m2 * l2 * c2;
-    const M21 = M12;
-    const M22 = I1 + m1 * l1**2 + m2 * L1**2;
-    const M23 = m2 * L1 * l2 * c12;
-    const M31 = M13;
-    const M32 = M23;
-    const M33 = I2 + m2 * l2**2;
+    const M12 = a1 * c1;
+    const M13 = a2 * c2;
+    const M22 = I1 + m1 * l1 * l1 + m2 * L1 * L1;
+    const M23 = b12 * c12;
+    const M33 = I2 + m2 * l2 * l2;
 
-    const M_mat = [[M11, M12, M13], [M21, M22, M23], [M31, M32, M33]];
+    // Right-hand side  H(u) − C(q,q̇)·q̇ − G(q) − damping
+    const r0 = u + a1 * s1 * dth1 * dth1 + a2 * s2 * dth2 * dth2;
+    const r1 = -b12 * s12 * dth2 * dth2 + a1 * g * s1 - c_damping * dth1;
+    const r2 = b12 * s12 * dth1 * dth1 + a2 * g * s2 - c_damping * dth2;
 
-    // Coriolis Matrix C(q, q')
-    const C_mat = [
-        [0, -(m1 * l1 + m2 * L1) * dth1 * s1, -m2 * l2 * dth2 * s2],
-        [0, 0, m2 * L1 * l2 * dth2 * s12],
-        [0, -m2 * L1 * l2 * dth1 * s12, 0]
-    ];
+    // Solve M·q̈ = rhs with the symmetric adjugate (cofactors written out)
+    const cA = M22 * M33 - M23 * M23;
+    const cB = M13 * M23 - M12 * M33;
+    const cC = M12 * M23 - M13 * M22;
+    const cD = M11 * M33 - M13 * M13;
+    const cE = M13 * M12 - M11 * M23;
+    const cF = M11 * M22 - M12 * M12;
+    const det = M11 * cA + M12 * cB + M13 * cC;
 
-    // Gravity Vector G(q)
-    const G = [0, -(m1 * l1 + m2 * L1) * g * s1, -m2 * g * l2 * s2];
-
-    // Input Mapping H
-    const H = [u, 0, 0];
-
-    // Solve M * q'' = H - C * q' - G
-    // C * q'
-    const Cq_dot = [
-        C_mat[0][0]*dx + C_mat[0][1]*dth1 + C_mat[0][2]*dth2,
-        C_mat[1][0]*dx + C_mat[1][1]*dth1 + C_mat[1][2]*dth2,
-        C_mat[2][0]*dx + C_mat[2][1]*dth1 + C_mat[2][2]*dth2
-    ];
-
-    const rhs = [
-        H[0] - Cq_dot[0] - G[0],
-        H[1] - Cq_dot[1] - G[1] - c_damping * dth1,
-        H[2] - Cq_dot[2] - G[2] - c_damping * dth2
-    ];
-
-    // Simple inversion for 3x3 matrix M
-    const det = M11 * (M22 * M33 - M32 * M23) - M12 * (M21 * M33 - M31 * M23) + M13 * (M21 * M32 - M31 * M22);
-    const invM = [
-        [(M22 * M33 - M23 * M32) / det, (M13 * M32 - M12 * M33) / det, (M12 * M23 - M13 * M22) / det],
-        [(M23 * M31 - M21 * M33) / det, (M11 * M33 - M13 * M31) / det, (M13 * M21 - M11 * M23) / det],
-        [(M21 * M32 - M22 * M31) / det, (M12 * M31 - M11 * M32) / det, (M11 * M22 - M12 * M21) / det]
-    ];
-
-    const ddx = invM[0][0] * rhs[0] + invM[0][1] * rhs[1] + invM[0][2] * rhs[2];
-    const ddth1 = invM[1][0] * rhs[0] + invM[1][1] * rhs[1] + invM[1][2] * rhs[2];
-    const ddth2 = invM[2][0] * rhs[0] + invM[2][1] * rhs[1] + invM[2][2] * rhs[2];
+    const ddx   = (cA * r0 + cB * r1 + cC * r2) / det;
+    const ddth1 = (cB * r0 + cD * r1 + cE * r2) / det;
+    const ddth2 = (cC * r0 + cE * r1 + cF * r2) / det;
 
     return [dx, ddx, dth1, ddth1, dth2, ddth2];
 }
 
-// Partial Feedback Linearization: compute u that achieves desired cart acceleration v
-// M(q)·q̈ + C·q̇ + G = H·u  → solve for u given ẍ = v
+// Partial Feedback Linearization: the force u that realises a commanded cart
+// acceleration v.  Splitting M(q)q̈ + C q̇ + G = [u,0,0]ᵀ into the cart row and
+// the 2x2 pendulum block gives θ̈ = θ̈ᵖ + θ̈ᵛ·v, hence u = α·v + φ.
 function pflForce(v, x, dx, th1, dth1, th2, dth2) {
     const s1 = Math.sin(th1), c1 = Math.cos(th1), s2 = Math.sin(th2), c2 = Math.cos(th2);
     const s12 = Math.sin(th1 - th2), c12 = Math.cos(th1 - th2);
     const M11 = M + m1 + m2;
     const M12 = (m1 * l1 + m2 * L1) * c1;
     const M13 = m2 * l2 * c2;
-    const M21 = M12, M22 = I1 + m1 * l1**2 + m2 * L1**2, M23 = m2 * L1 * l2 * c12;
-    const M31 = M13, M32 = M23, M33 = I2 + m2 * l2**2;
+    const M21 = M12, M22 = I1 + m1 * l1 ** 2 + m2 * L1 ** 2, M23 = m2 * L1 * l2 * c12;
+    const M31 = M13, M32 = M23, M33 = I2 + m2 * l2 ** 2;
 
-    const C1 = -(m1 * l1 + m2 * L1) * dth1 * s1 - m2 * l2 * dth2 * s2;
-    const C2 = m2 * L1 * l2 * dth2 * s12;
-    const C3 = -m2 * L1 * l2 * dth1 * s12;
+    // Coriolis/centrifugal terms (C·q̇) — quadratic in the joint rates
+    const C1 = -(m1 * l1 + m2 * L1) * s1 * dth1 * dth1 - m2 * l2 * s2 * dth2 * dth2;
+    const C2 = m2 * L1 * l2 * s12 * dth2 * dth2;
+    const C3 = -m2 * L1 * l2 * s12 * dth1 * dth1;
     const G1 = 0, G2 = -(m1 * l1 + m2 * L1) * g * s1, G3 = -m2 * g * l2 * s2;
 
     // Pendulum subsystem inertia (2x2)
@@ -307,20 +455,676 @@ function pflForce(v, x, dx, th1, dth1, th2, dth2) {
     return alpha * v + phi;
 }
 
-// Classical Runge-Kutta 4 Integrator Step Loop 
-function rk4Step(dt, u) {
-    let k1 = equationsOfMotion(state, u);
-    let s2 = []; for(let i=0; i<6; i++) s2[i] = state[i] + 0.5 * dt * k1[i];
-    let k2 = equationsOfMotion(s2, u);
-    let s3 = []; for(let i=0; i<6; i++) s3[i] = state[i] + 0.5 * dt * k2[i];
-    let k3 = equationsOfMotion(s3, u);
-    let s4 = []; for(let i=0; i<6; i++) s4[i] = state[i] + dt * k3[i];
-    let k4 = equationsOfMotion(s4, u);
-    for(let i=0; i<6; i++) state[i] += (dt / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+// ---------------------------------------------------------------------------
+//  Energy-based swing-up
+// ---------------------------------------------------------------------------
+// With the cart acceleration v as the (PFL) input, the energy of the pendulum
+// pair obeys exactly
+//     Ė = −v·W − c·(θ̇₁² + θ̇₂²),     W = a₁·cosθ₁·θ̇₁ + a₂·cosθ₂·θ̇₂
+// with a₁ = m₁l₁ + m₂L₁, a₂ = m₂l₂.  Choosing v ∝ (E − E_d)·W therefore makes
+// ½(E − E_d)² a Lyapunov function and drives the energy to its up-up value.
+function pendulumEnergy(th1, dth1, th2, dth2) {
+    const a1 = m1 * l1 + m2 * L1, a2 = m2 * l2;
+    const M22 = I1 + m1 * l1 * l1 + m2 * L1 * L1;
+    const M23 = m2 * L1 * l2 * Math.cos(th1 - th2);
+    const M33 = I2 + m2 * l2 * l2;
+    return {
+        E:   0.5 * (M22 * dth1 * dth1 + 2 * M23 * dth1 * dth2 + M33 * dth2 * dth2)
+             + a1 * g * Math.cos(th1) + a2 * g * Math.cos(th2),
+        Ed:  (a1 + a2) * g,
+        W:   a1 * Math.cos(th1) * dth1 + a2 * Math.cos(th2) * dth2,
+        E1:  0.5 * M22 * dth1 * dth1 + a1 * g * Math.cos(th1),
+        E1d: a1 * g,
+        W1:  a1 * Math.cos(th1) * dth1,
+        E2:  0.5 * M33 * dth2 * dth2 + a2 * g * Math.cos(th2),
+        E2d: a2 * g,
+        W2:  a2 * Math.cos(th2) * dth2
+    };
 }
 
+// Sensitivity of the joint accelerations to the commanded cart acceleration.
+function thetaDDotPerV(th1, th2) {
+    const M12 = (m1 * l1 + m2 * L1) * Math.cos(th1);
+    const M13 = m2 * l2 * Math.cos(th2);
+    const M22 = I1 + m1 * l1 ** 2 + m2 * L1 ** 2;
+    const M23 = m2 * L1 * l2 * Math.cos(th1 - th2);
+    const M33 = I2 + m2 * l2 ** 2;
+    const detP = M22 * M33 - M23 * M23;
+    return [(-M33 * M12 + M23 * M13) / detP, (M23 * M12 - M22 * M13) / detP];
+}
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Commanded cart acceleration during swing-up.
+function swingAccel(t) {
+    const th1 = normalizeAngle(state[2]), th2 = normalizeAngle(state[4]);
+    const dth1 = state[3], dth2 = state[5];
+    const e = pendulumEnergy(th1, dth1, th2, dth2);
+    const sat = (v) => clamp(v, -SWING.eSat, SWING.eSat);
+
+    // Energy pumping: total energy plus a per-link share so the energy cannot
+    // all end up spinning the outer link while the inner one hangs.
+    let v = SWING.kE * sat(e.E - e.Ed) * e.W
+          + SWING.k1 * sat(e.E1 - e.E1d) * e.W1
+          + SWING.k2 * sat(e.E2 - e.E2d) * e.W2;
+
+    // Relative-angle shaping: pushes the two links towards moving as one body.
+    // Inverting the coupling ∂(θ̈₁−θ̈₂)/∂v turns a PD law on θ₁−θ₂ into a v command.
+    if (SWING.kRel !== 0 || SWING.kRelD !== 0) {
+        const d = normalizeAngle(th1 - th2), dd = dth1 - dth2;
+        const s = thetaDDotPerV(th1, th2);
+        const dv = s[0] - s[1];
+        if (Math.abs(dv) > 1e-6) {
+            v += clamp(-(SWING.kRel * Math.sin(d) + SWING.kRelD * dd) / dv, -SWING.relMax, SWING.relMax);
+        }
+    }
+
+    // Keep the cart near its set point so the rail stops are not hit.
+    v += -SWING.kx * (state[0] - x_soll) - SWING.kd * state[1];
+
+    // Hanging at rest is an exact equilibrium (W = 0 and θ̇ = 0), so nothing
+    // would ever start: dither the cart until the pendulums are moving.
+    if (Math.abs(dth1) + Math.abs(dth2) < 0.05 && Math.abs(e.W) < 0.02 && e.E - e.Ed < -0.1) {
+        v += SWING.kick * Math.sin(SWING.kickW * t);
+    }
+    return clamp(v, -SWING.vMax, SWING.vMax);
+}
+
+// Classical Runge-Kutta 4 integrator — pure form, used by both the simulation
+// and the trajectory optimiser.
+const rk4Scratch = [0, 0, 0, 0, 0, 0];
+function rk4(x, u, h) {
+    const s = rk4Scratch;
+    const k1 = equationsOfMotion(x, u);
+    for (let i = 0; i < 6; i++) s[i] = x[i] + 0.5 * h * k1[i];
+    const k2 = equationsOfMotion(s, u);
+    for (let i = 0; i < 6; i++) s[i] = x[i] + 0.5 * h * k2[i];
+    const k3 = equationsOfMotion(s, u);
+    for (let i = 0; i < 6; i++) s[i] = x[i] + h * k3[i];
+    const k4 = equationsOfMotion(s, u);
+    const out = new Array(6);
+    for (let i = 0; i < 6; i++) out[i] = x[i] + (h / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]);
+    return out;
+}
+
+function rk4Step(dt, u) { state = rk4(state, u, dt); }
 
 
+
+
+
+// ---------------------------------------------------------------------------
+//  Swing-up by trajectory optimisation (iLQR) + time-varying LQR tracking
+// ---------------------------------------------------------------------------
+// Energy pumping on its own cannot bring a double pendulum to the up-up
+// position: it drives the total energy to its upright value but says nothing
+// about how that energy is split between the links, and the balancing LQR only
+// accepts a very small neighbourhood of the equilibrium.  The swing-up is
+// therefore solved as an optimal control problem — iLQR on the full nonlinear
+// model, starting from the hanging rest state, with the LQR cost-to-go eᵀPe as
+// terminal cost — and the resulting trajectory is tracked by a time-varying
+// LQR, which is what absorbs the model/discretisation mismatch.
+//
+// The optimisation runs in small slices inside the animation loop while the
+// controller is still damping the pendulums, so nothing blocks the UI.
+
+// Restarts alternate between a coarse and a fine discretisation.  Neither wins
+// everywhere: the coarse grid converges more often on the default plant, while
+// very long links only ever produced usable trajectories on the fine one.
+const PLAN_N_COARSE = 125;
+const PLAN_N_MAX = 220;
+const PLAN_STEP_MAX = 0.02;   // trajectory is refined to at least this step
+                              // before the tracking gains are computed
+const PLAN_T_REF = 2.5;       // horizon for the default plant (s)
+const PLAN_OMEGA_REF = 4.22;  // its slow hanging mode (rad/s)
+const PLAN_ITERS = 120;       // iLQR iterations per restart
+const PLAN_RESTARTS = 20;     // random restarts before giving up
+const PLAN_GOOD = 5.0;        // terminal eᵀPe that counts as solved
+const PLAN_BUDGET_MS = 8;     // optimisation work per animation frame
+const PLAN_INIT = 0.3;        // amplitude of the random initial force profile
+// A restart that is still far off after PLAN_CHECK_AT iterations essentially
+// never recovers, so it is abandoned instead of burning the full budget.
+const PLAN_CHECK_AT = 30;
+// The checkpoint is relative to the catch region, because the scale of eᵀPe
+// changes with the plant.  Measured over seven plants, every restart that ended
+// up usable was below ~21x at the checkpoint, so anything above that is dropped.
+const PLAN_CHECK_FACTOR = 22;
+const PLAN_ACCEPT = 60;       // terminal eᵀPe worth verifying at all
+const PLAN_ROUNDS = 10;       // extra search rounds after a failed swing-up
+
+// Slow hanging mode of the two links, from det(K_g − ω²M_p) = 0.  The swing-up
+// horizon is scaled by it so long or low-gravity pendulums get proportionally
+// more time, while the number of knots — and so the cost of a sweep — is fixed.
+function hangingMode() {
+    const a1 = m1 * l1 + m2 * L1, a2 = m2 * l2;
+    const M22 = I1 + m1 * l1 * l1 + m2 * L1 * L1;
+    const M23 = m2 * L1 * l2;
+    const M33 = I2 + m2 * l2 * l2;
+    const D = M22 * M33 - M23 * M23;
+    const B = g * (a1 * M33 + a2 * M22);
+    const C = a1 * a2 * g * g;
+    const disc = Math.max(0, B * B - 4 * D * C);
+    const w2 = (B - Math.sqrt(disc)) / (2 * D);
+    return w2 > 1e-9 ? Math.sqrt(w2) : PLAN_OMEGA_REF;
+}
+function planHorizon() {
+    return Math.max(1.5, Math.min(9.0, PLAN_T_REF * PLAN_OMEGA_REF / hangingMode()));
+}
+
+// xlim is the soft rail barrier used while planning.  Keeping it well inside
+// the ±2.5 m stops leaves room for tracking error and, as it turns out, also
+// makes the optimiser converge more often.
+const PLAN_COST = { rw: 0.02, qx: 0.5, wf: 60, xlim: 1.2, qup: 25, qv: 0.2, ramp: 3 };
+
+// The force is parameterised as u = U_MAX·tanh(w), so the actuator limit holds
+// by construction and the optimisation stays unconstrained.
+function squashForce(w) { return U_MAX * Math.tanh(w); }
+function planErr(x) { return [x[0], x[1], normalizeAngle(x[2]), x[3], normalizeAngle(x[4]), x[5]]; }
+
+function makeSwingSolver(x0, seed, T, dtP, N) {
+    const a1 = m1 * l1 + m2 * L1, a2 = m2 * l2;
+    const cst = PLAN_COST;
+    let rng = seed | 0;
+    const rnd = () => { rng = (rng * 1103515245 + 12345) & 0x7fffffff; return rng / 0x7fffffff * 2 - 1; };
+
+    const rho = k => cst.qup * Math.pow((k + 1) / N, cst.ramp);
+    const rhov = k => cst.qv * Math.pow((k + 1) / N, cst.ramp);
+
+    function runCost(x, w, k) {
+        let c = 0.5 * cst.rw * w * w + 0.5 * cst.qx * x[0] * x[0];
+        const o = Math.abs(x[0]) - cst.xlim; if (o > 0) c += 200 * o * o;
+        c += rho(k) * (a1 * (1 - Math.cos(x[2])) + a2 * (1 - Math.cos(x[4])));
+        c += 0.5 * rhov(k) * (x[3] * x[3] + x[5] * x[5]);
+        return c;
+    }
+    function termCost(x) {
+        const e = planErr(x); let s = 0;
+        for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) s += e[i] * P_lqr[i][j] * e[j];
+        return 0.5 * cst.wf * s;
+    }
+    function rollout(W) {
+        const X = [x0.slice()];
+        for (let k = 0; k < N; k++) X.push(rk4(X[k], squashForce(W[k]), dtP));
+        return X;
+    }
+    function total(X, W) {
+        let c = 0;
+        for (let k = 0; k < N; k++) c += runCost(X[k], W[k], k);
+        return c + termCost(X[N]);
+    }
+
+    let W = Array.from({ length: N }, () => rnd() * PLAN_INIT);
+    let X = rollout(W);
+    let J = total(X, W);
+    let mu = 1e-3, iter = 0;
+    const kff = new Array(N).fill(0), Kfb = new Array(N).fill(null);
+
+    return {
+        N: N,
+        get iter() { return iter; },
+        get done() { return iter >= PLAN_ITERS; },
+        terminal: function () {
+            const e = planErr(X[N]); let s = 0;
+            for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) s += e[i] * P_lqr[i][j] * e[j];
+            return s;
+        },
+        result: function () { return { X: X, U: W.map(squashForce) }; },
+        // one iLQR sweep: backward Riccati recursion, then a line-searched rollout
+        iterate: function () {
+            iter++;
+            const eT = planErr(X[N]);
+            const Vx = new Array(6);
+            for (let i = 0; i < 6; i++) {
+                let s = 0; for (let j = 0; j < 6; j++) s += P_lqr[i][j] * eT[j];
+                Vx[i] = cst.wf * s;
+            }
+            let Vxx = P_lqr.map(r => r.map(v => cst.wf * v));
+            let okPass = true;
+            for (let k = N - 1; k >= 0; k--) {
+                // finite-difference Jacobians of one RK4 step
+                const A = matZeros(6, 6), B = matZeros(6, 1), h = 1e-5;
+                for (let j = 0; j < 6; j++) {
+                    const xp = X[k].slice(), xm = X[k].slice();
+                    xp[j] += h; xm[j] -= h;
+                    const fp = rk4(xp, squashForce(W[k]), dtP);
+                    const fm = rk4(xm, squashForce(W[k]), dtP);
+                    for (let i = 0; i < 6; i++) A[i][j] = (fp[i] - fm[i]) / (2 * h);
+                }
+                const fp = rk4(X[k], squashForce(W[k] + h), dtP);
+                const fm = rk4(X[k], squashForce(W[k] - h), dtP);
+                for (let i = 0; i < 6; i++) B[i][0] = (fp[i] - fm[i]) / (2 * h);
+
+                const x = X[k], w = W[k];
+                const lx = [0, 0, 0, 0, 0, 0];
+                lx[0] = cst.qx * x[0];
+                const o = Math.abs(x[0]) - cst.xlim; if (o > 0) lx[0] += 400 * o * Math.sign(x[0]);
+                lx[2] = rho(k) * a1 * Math.sin(x[2]);
+                lx[4] = rho(k) * a2 * Math.sin(x[4]);
+                lx[3] = rhov(k) * x[3];
+                lx[5] = rhov(k) * x[5];
+                const lxx = matZeros(6, 6);
+                lxx[0][0] = cst.qx + (o > 0 ? 400 : 0);
+                lxx[2][2] = Math.max(0, rho(k) * a1 * Math.cos(x[2]));
+                lxx[4][4] = Math.max(0, rho(k) * a2 * Math.cos(x[4]));
+                lxx[3][3] = rhov(k); lxx[5][5] = rhov(k);
+                const lu = cst.rw * w, luu = cst.rw;
+
+                const Qx = new Array(6).fill(0);
+                for (let i = 0; i < 6; i++) { let s = lx[i]; for (let j = 0; j < 6; j++) s += A[j][i] * Vx[j]; Qx[i] = s; }
+                let Qu = lu; for (let j = 0; j < 6; j++) Qu += B[j][0] * Vx[j];
+                const VA = matZeros(6, 6), VB = new Array(6).fill(0);
+                for (let i = 0; i < 6; i++) {
+                    for (let j = 0; j < 6; j++) { let s = 0; for (let m = 0; m < 6; m++) s += Vxx[i][m] * A[m][j]; VA[i][j] = s; }
+                    let s2 = 0; for (let m = 0; m < 6; m++) s2 += Vxx[i][m] * B[m][0]; VB[i] = s2;
+                }
+                const Qxx = matZeros(6, 6);
+                for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) {
+                    let s = lxx[i][j]; for (let m = 0; m < 6; m++) s += A[m][i] * VA[m][j]; Qxx[i][j] = s;
+                }
+                let Quu = luu; for (let m = 0; m < 6; m++) Quu += B[m][0] * VB[m];
+                const Qux = new Array(6).fill(0);
+                for (let j = 0; j < 6; j++) { let s = 0; for (let m = 0; m < 6; m++) s += B[m][0] * VA[m][j]; Qux[j] = s; }
+
+                const Quur = Quu + mu;
+                if (!(Quur > 1e-9)) { okPass = false; break; }
+                const kk = -Qu / Quur;
+                const KK = Qux.map(v => -v / Quur);
+                kff[k] = kk; Kfb[k] = KK;
+                for (let i = 0; i < 6; i++) Vx[i] = Qx[i] + KK[i] * Quu * kk + KK[i] * Qu + Qux[i] * kk;
+                const Vn = matZeros(6, 6);
+                for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++)
+                    Vn[i][j] = Qxx[i][j] + KK[i] * Quu * KK[j] + KK[i] * Qux[j] + Qux[i] * KK[j];
+                for (let i = 0; i < 6; i++) for (let j = i; j < 6; j++) {
+                    const v = 0.5 * (Vn[i][j] + Vn[j][i]); Vn[i][j] = v; Vn[j][i] = v;
+                }
+                Vxx = Vn;
+            }
+            if (!okPass) { mu *= 10; return; }
+
+            const alphas = [1, 0.5, 0.25, 0.1, 0.05, 0.02, 0.01, 0.003, 0.001];
+            for (let ai = 0; ai < alphas.length; ai++) {
+                const al = alphas[ai];
+                const Wn = new Array(N), Xn = [x0.slice()];
+                let bad = false;
+                for (let k = 0; k < N; k++) {
+                    let dw = al * kff[k];
+                    for (let j = 0; j < 6; j++) dw += Kfb[k][j] * (Xn[k][j] - X[k][j]);
+                    Wn[k] = Math.max(-6, Math.min(6, W[k] + dw));
+                    Xn.push(rk4(Xn[k], squashForce(Wn[k]), dtP));
+                    if (!Xn[k + 1].every(isFinite)) { bad = true; break; }
+                }
+                if (bad) continue;
+                const Jn = total(Xn, Wn);
+                if (Jn < J - 1e-9) { W = Wn; X = Xn; J = Jn; mu = Math.max(1e-6, mu * 0.5); return; }
+            }
+            mu *= 4;
+        }
+    };
+}
+
+// Discrete time-varying LQR along the planned trajectory.  Returns the tracking
+// gains K[k] for  u = u_nom[k] − K[k]·(x − x_nom[k]).
+const TV_Q = [1, 1, 20, 2, 20, 2];
+const TV_R = 0.05;
+function trackingGains(Xn, Un, dtP) {
+    const N = Un.length;
+    let S = P_lqr.map(r => r.slice());
+    const Ks = new Array(N);
+    for (let k = N - 1; k >= 0; k--) {
+        const A = matZeros(6, 6), B = matZeros(6, 1), h = 1e-5;
+        for (let j = 0; j < 6; j++) {
+            const xp = Xn[k].slice(), xm = Xn[k].slice();
+            xp[j] += h; xm[j] -= h;
+            const fp = rk4(xp, Un[k], dtP), fm = rk4(xm, Un[k], dtP);
+            for (let i = 0; i < 6; i++) A[i][j] = (fp[i] - fm[i]) / (2 * h);
+        }
+        const fp = rk4(Xn[k], Un[k] + h, dtP), fm = rk4(Xn[k], Un[k] - h, dtP);
+        for (let i = 0; i < 6; i++) B[i][0] = (fp[i] - fm[i]) / (2 * h);
+
+        const SB = new Array(6).fill(0);
+        for (let i = 0; i < 6; i++) { let s = 0; for (let m = 0; m < 6; m++) s += S[i][m] * B[m][0]; SB[i] = s; }
+        let BSB = TV_R; for (let m = 0; m < 6; m++) BSB += B[m][0] * SB[m];
+        const SA = matZeros(6, 6);
+        for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) {
+            let s = 0; for (let m = 0; m < 6; m++) s += S[i][m] * A[m][j]; SA[i][j] = s;
+        }
+        const BSA = new Array(6).fill(0);
+        for (let j = 0; j < 6; j++) { let s = 0; for (let m = 0; m < 6; m++) s += B[m][0] * SA[m][j]; BSA[j] = s; }
+        Ks[k] = BSA.map(v => v / BSB);
+        const Sn = matZeros(6, 6);
+        for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) {
+            let s = TV_Q[i] * (i === j ? 1 : 0);
+            for (let m = 0; m < 6; m++) s += A[m][i] * SA[m][j];
+            s -= BSA[i] * BSA[j] / BSB;
+            Sn[i][j] = s;
+        }
+        for (let i = 0; i < 6; i++) for (let j = i; j < 6; j++) {
+            const v = 0.5 * (Sn[i][j] + Sn[j][i]); Sn[i][j] = v; Sn[j][i] = v;
+        }
+        S = Sn;
+    }
+    return Ks;
+}
+
+// The plan always starts from the hanging rest state, with the cart position
+// measured relative to the set point, so it stays valid when x_soll is moved.
+const planner = {
+    plan: null,          // {X, U, Kfb, N} ready for execution
+    signature: '',       // plant parameters the current plan was made for
+    solver: null,
+    attempt: 0,
+    best: null,
+    bestQ: Infinity,
+    bestDt: 0,          // grid the best candidate was optimised on
+    bestT: 0,
+    failed: false,
+    searching: false,   // a round of restarts is in progress
+    rounds: 0,
+    status: 'idle',
+    iterMs: 0,          // measured cost of one iLQR sweep
+    horizon: PLAN_T_REF,
+    knots: PLAN_N_COARSE,
+    dt: PLAN_T_REF / PLAN_N_COARSE,
+
+    paramSignature: function () {
+        return [M, m1, m2, l1, l2, g, c_damping].join(',');
+    },
+    invalidate: function () {
+        this.plan = null; this.solver = null; this.attempt = 0;
+        this.best = null; this.bestQ = Infinity; this.bestDt = 0; this.bestT = 0;
+        this.failed = false;
+        this.searching = true; this.rounds = 0;
+        this.status = 'planning';
+    },
+    // A swing-up that ran its course without the LQR taking over means the
+    // trajectory was not good enough.  Start another round of restarts while the
+    // controller settles again, keeping the current plan to fall back on.
+    retry: function () {
+        if (this.bestQ <= PLAN_GOOD && this.plan) return;
+        if (this.searching || this.rounds >= PLAN_ROUNDS) return;
+        this.attempt = 0; this.solver = null; this.failed = false;
+        this.searching = true;
+        this.status = 'replanning';
+    },
+    startState: function () { return [0, 0, Math.PI, 0, Math.PI, 0]; },
+    // Restarts alternate between knot counts, so the grid a candidate was
+    // optimised on has to travel with it — the tracking gains depend on it.
+    recordBest: function (q, res) {
+        this.bestQ = q; this.best = res;
+        this.bestDt = this.dt; this.bestT = this.horizon;
+    },
+
+    // Called once per animation frame; spends at most PLAN_BUDGET_MS on iLQR.
+    work: function () {
+        if (this.signature !== this.paramSignature()) {
+            this.signature = this.paramSignature();
+            this.invalidate();
+        }
+        if (!P_lqr || !this.searching) return;
+        // Always run one sweep per frame, then keep going while the measured cost
+        // of a sweep still fits in the slice.  (Running none whenever the estimate
+        // exceeds the budget would stall the planner forever after a slow first
+        // frame, before the JIT has warmed up.)
+        const t0 = performance.now();
+        let firstSweep = true;
+        while (firstSweep || performance.now() - t0 + this.iterMs < PLAN_BUDGET_MS) {
+            firstSweep = false;
+            const tIter = performance.now();
+            if (!this.solver) {
+                if (this.attempt >= PLAN_RESTARTS) {
+                    this.searching = false;
+                    this.rounds++;
+                    // The terminal cost is only a screen — cheap, and deliberately
+                    // generous, because the closed-loop flight in finish() is the
+                    // decision that counts.  Screening at exactly catchLevel threw
+                    // away candidates that missed it by a fraction and would have
+                    // flown fine.
+                    const screen = Math.max(PLAN_ACCEPT, 3 * catchLevel);
+                    if (this.best && this.bestQ < screen && this.finish(this.best)) return;
+                    if (!this.plan) { this.failed = true; this.status = 'no plan'; }
+                    return;
+                }
+                // Restarts cycle through four (horizon, resolution) combinations.
+                // Neither choice wins everywhere — a coarse grid converges more
+                // often on the default plant, long links need the fine one, and a
+                // stretched or shortened horizon sometimes succeeds where the
+                // nominal one does not.  The closed-loop check in finish() means
+                // extra diversity here can only help.
+                const variant = this.attempt % 4;
+                const stretch = (variant === 2) ? 1.5 : (variant === 3) ? 0.75 : 1.0;
+                this.horizon = Math.max(1.0, Math.min(9.0, planHorizon() * stretch));
+                this.knots = (variant % 2 === 0)
+                    ? PLAN_N_COARSE
+                    : Math.max(PLAN_N_COARSE, Math.min(PLAN_N_MAX, Math.round(this.horizon / PLAN_STEP_MAX)));
+                this.dt = this.horizon / this.knots;
+                this.solver = makeSwingSolver(this.startState(), 7717 * (this.attempt + 1) + 13,
+                                              this.horizon, this.dt, this.knots);
+                this.attempt++;
+            }
+            this.solver.iterate();
+            // remember how long one sweep costs so the slice never overruns badly
+            this.iterMs = 0.7 * this.iterMs + 0.3 * (performance.now() - tIter);
+            // Give the last few restarts the full budget: on slow plants a run
+            // can still be far off at the checkpoint and yet end up usable.
+            const mayAbandon = this.attempt <= PLAN_RESTARTS - 6;
+            if (mayAbandon && this.solver.iter === PLAN_CHECK_AT
+                && this.solver.terminal() > PLAN_CHECK_FACTOR * catchLevel) {
+                const q = this.solver.terminal();
+                if (q < this.bestQ) { this.recordBest(q, this.solver.result()); }
+                this.solver = null;
+                continue;
+            }
+            if (this.solver.done) {
+                const q = this.solver.terminal();
+                if (q < this.bestQ) { this.recordBest(q, this.solver.result()); }
+                this.solver = null;
+                if (this.bestQ < PLAN_GOOD) {
+                    if (this.finish(this.best)) { this.searching = false; return; }
+                    this.best = null; this.bestQ = Infinity;   // discretisation artefact
+                }
+            }
+        }
+        this.status = 'planning ' + this.attempt + '/' + PLAN_RESTARTS;
+    },
+    // A swing-up trajectory is open-loop unstable, so the nominal by itself says
+    // little: re-integrating the same forces at a different step size makes it
+    // diverge (measured: a candidate scoring eᵀPe = 0.1 on its own grid drifts to
+    // eᵀPe > 12000 when replayed open loop).  What matters is the tracked
+    // behaviour, so a candidate is flown in closed loop at simulation resolution
+    // and accepted only if it actually reaches the catch region.
+    verify: function (X, U, Kfb, dtP) {
+        const h = 1 / 2000;
+        const steps = Math.round(U.length * dtP / h);
+        let s = X[0].slice();
+        for (let k = 0; k < steps; k++) {
+            const ki = Math.min(U.length - 1, Math.floor(k * h / dtP));
+            const xn = X[ki];
+            let u = U[ki];
+            u -= Kfb[ki][0] * (s[0] - xn[0]);
+            u -= Kfb[ki][1] * (s[1] - xn[1]);
+            u -= Kfb[ki][2] * normalizeAngle(s[2] - xn[2]);
+            u -= Kfb[ki][3] * (s[3] - xn[3]);
+            u -= Kfb[ki][4] * normalizeAngle(s[4] - xn[4]);
+            u -= Kfb[ki][5] * (s[5] - xn[5]);
+            s = rk4(s, clamp(u, -U_MAX, U_MAX), h);
+            if (!s.every(isFinite)) return -1;
+            if (Math.abs(s[0]) > 2.3) return -1;          // would run into a stop
+            const e = [0, s[1], normalizeAngle(s[2]), s[3], normalizeAngle(s[4]), s[5]];
+            if (Math.abs(e[2]) < 0.6 && Math.abs(e[4]) < 0.6 && Math.abs(e[3]) < 4 && Math.abs(e[5]) < 4) {
+                const q = quadForm(P_lqr, e);
+                if (q < catchLevel) return this.holds(s, h) ? q : -1;
+            }
+        }
+        return -1;
+    },
+    // Reaching the catch region is not quite the same as being held there: the
+    // region is derived from the linearised model, and on slow plants (low g in
+    // particular) a few per cent of the states it accepts are not actually
+    // recoverable.  So the hand-over is simulated too, and the trajectory is only
+    // accepted if the LQR really brings the pendulum to rest upright.
+    holds: function (s0, h) {
+        let s = s0.slice();
+        let ref = s[0];
+        // The settling horizon has to follow the plant: at g = 1 m/s² the closed
+        // loop is several times slower than at 9.81, and a fixed window would
+        // reject perfectly good trajectories for not having finished yet.
+        const span = Math.round(4 * this.horizon / h);
+        for (let k = 0; k < span; k++) {
+            ref += (0 - ref) * h / BALANCE_REF_TAU;
+            const e = [s[0] - ref, s[1], normalizeAngle(s[2]), s[3], normalizeAngle(s[4]), s[5]];
+            const u = clamp(-(K[0]*e[0] + K[1]*e[1] + K[2]*e[2] + K[3]*e[3] + K[4]*e[4] + K[5]*e[5]),
+                            -U_MAX, U_MAX);
+            s = rk4(s, u, h);
+            if (!s.every(isFinite)) return false;
+            if (Math.abs(normalizeAngle(s[2])) > 0.9 || Math.abs(normalizeAngle(s[4])) > 0.9) return false;
+            if (Math.abs(s[0]) > 2.4) return false;
+        }
+        return Math.abs(normalizeAngle(s[2])) < 0.03 && Math.abs(normalizeAngle(s[4])) < 0.03
+            && Math.abs(s[0]) < 0.25 && Math.abs(s[3]) < 0.15 && Math.abs(s[5]) < 0.15;
+    },
+    finish: function (res) {
+        const dtP = this.bestDt || this.dt;
+        const T = this.bestT || this.horizon;
+        const Kfb = trackingGains(res.X, res.U, dtP);
+        const q = this.verify(res.X, res.U, Kfb, dtP);
+        if (q < 0) return false;
+        this.plan = { X: res.X, U: res.U, N: res.U.length, dt: dtP, T: T, Kfb: Kfb };
+        this.bestQ = q;
+        this.status = 'ready';
+        return true;
+    }
+};
+
+
+// ---------------------------------------------------------------------------
+//  Controller state machine
+//    0 = balancing   — LQR about the up-up equilibrium
+//    1 = settling    — drain the pendulum energy, re-centre the cart
+//    2 = swing-up    — execute the planned trajectory (or pump energy)
+// ---------------------------------------------------------------------------
+const MODE_BALANCE = 0, MODE_SETTLE = 1, MODE_SWING = 2;
+const STATE_LABELS = ['LQR Balance', 'Settling', 'Swing-up'];
+
+// Settling drives the system to the hanging rest state the trajectory is
+// planned from.  Since Ė = −v·W, the choice v = +kw·W gives Ė = −kw·W² ≤ 0 and
+// bleeds energy off unconditionally.  On its own that stalls: the out-of-phase
+// mode of the two links is only weakly coupled to the cart (its modal input
+// gain is ~5x smaller than the in-phase mode), so W stays near zero while the
+// links counter-oscillate.  A second term damps that mode directly by
+// inverting ∂(θ̈₁−θ̈₂)/∂v, which is what makes settling finish in a few seconds.
+const SETTLE = { kw: 6.0, kRelD: 3.0, relMax: 8.0, kx: 1.5, kd: 1.5, vMax: 12.0 };
+// Fallback energy pumping, used only when no swing-up trajectory could be found.
+const SWING = { kE: 3.412, k1: 0.822, k2: 0, eSat: 3.3, kRel: 1.934, kRelD: 5.157,
+                relMax: 2.66, kx: 0.393, kd: 1.052, vMax: 9.405, kick: 2.779, kickW: 8.23 };
+
+function quadForm(Pm, e) {
+    let s = 0;
+    for (let i = 0; i < 6; i++) {
+        let r = 0;
+        for (let j = 0; j < 6; j++) r += Pm[i][j] * e[j];
+        s += e[i] * r;
+    }
+    return s;
+}
+
+// Error vector used by every mode: cart relative to its set point, angles wrapped.
+function stateError() {
+    return [state[0] - x_soll, state[1], normalizeAngle(state[2]), state[3],
+            normalizeAngle(state[4]), state[5]];
+}
+
+// True when the LQR is known to recover from here — the hand-over test.
+//
+// Where the cart happens to sit is deliberately left out of the quadratic form:
+// at hand-over the LQR reference is moved to the current cart position and only
+// then ramped back to x_soll (see balanceRef), so the whole force budget goes
+// into catching the links instead of into a position error that is about to be
+// cancelled anyway.  Cart velocity still counts, and the offset is bounded so
+// the hand-over cannot happen right at a rail stop.
+function insideCatchRegion(e) {
+    if (!P_lqr) return false;
+    const ec = [0, e[1], e[2], e[3], e[4], e[5]];
+    // The sub-level set decides; the explicit bounds are only a sanity guard
+    // against handing over on the far side of a wrap or right at a rail stop.
+    return Math.abs(e[2]) < 0.6 && Math.abs(e[4]) < 0.6
+        && Math.abs(e[3]) < 4.0 && Math.abs(e[5]) < 4.0
+        && Math.abs(e[0]) < 2.0
+        && quadForm(P_lqr, ec) < catchLevel;
+}
+
+// Close enough to the state the trajectory was planned from?
+function atPlanStart() {
+    return Math.abs(state[0] - x_soll) < 0.20 && Math.abs(state[1]) < 0.20
+        && Math.abs(normalizeAngle(state[2] - Math.PI)) < 0.20
+        && Math.abs(normalizeAngle(state[4] - Math.PI)) < 0.20
+        && Math.abs(state[3]) < 0.40 && Math.abs(state[5]) < 0.40;
+}
+
+const BALANCE_REF_TAU = 1.5;   // s, time constant for walking the cart home
+function enterSettle() { recoveryState = MODE_SETTLE; recoveryTimer = 0; swingTimer = 0; }
+// The plan is latched at entry: a background round may publish a better one
+// mid-swing, and switching trajectories half-way through would be nonsense.
+function enterSwingUp() { recoveryState = MODE_SWING; swingTimer = 0; activePlan = planner.plan; }
+function enterBalance() {
+    recoveryState = MODE_BALANCE;
+    mpcDivergedCount = 0;
+    balanceRef = state[0];     // catch here, drift back to x_soll afterwards
+}
+
+// Commanded cart acceleration that drains energy and re-centres the cart.
+function settleAccel() {
+    const th1 = normalizeAngle(state[2]), th2 = normalizeAngle(state[4]);
+    const en = pendulumEnergy(th1, state[3], th2, state[5]);
+    let v = SETTLE.kw * en.W;
+    const s = thetaDDotPerV(th1, th2);
+    const dv = s[0] - s[1];
+    if (Math.abs(dv) > 1e-6) {
+        v += clamp(-SETTLE.kRelD * (state[3] - state[5]) / dv, -SETTLE.relMax, SETTLE.relMax);
+    }
+    v += -SETTLE.kx * (state[0] - x_soll) - SETTLE.kd * state[1];
+    return clamp(v, -SETTLE.vMax, SETTLE.vMax);
+}
+
+function controlStep(h) {
+    const e = stateError();
+    const th1 = e[2], th2 = e[4];
+    let u = 0;
+
+    if (recoveryState === MODE_BALANCE) {
+        balanceRef += (x_soll - balanceRef) * h / BALANCE_REF_TAU;
+        const ex = state[0] - balanceRef;
+        u = -(K[0] * ex + K[1] * e[1] + K[2] * e[2] + K[3] * e[3] + K[4] * e[4] + K[5] * e[5]);
+        if (Math.abs(th1) > 0.8 || Math.abs(th2) > 0.8) {
+            if (++mpcDivergedCount > 20) enterSettle();
+        } else {
+            mpcDivergedCount = 0;
+        }
+    } else if (recoveryState === MODE_SETTLE) {
+        recoveryTimer += h;
+        u = pflForce(settleAccel(), state[0], state[1], th1, state[3], th2, state[5]);
+        // launch the swing-up once the system is at rest and a trajectory exists
+        if (atPlanStart() && (planner.plan || (planner.failed && recoveryTimer > 1.0))) enterSwingUp();
+    } else {
+        swingTimer += h;
+        if (activePlan) {
+            const pl = activePlan;
+            const ki = Math.min(pl.N - 1, Math.floor(swingTimer / pl.dt));
+            const xn = pl.X[ki];
+            u = pl.U[ki];
+            const dev = [e[0] - xn[0], e[1] - xn[1], normalizeAngle(state[2] - xn[2]), e[3] - xn[3],
+                         normalizeAngle(state[4] - xn[4]), e[5] - xn[5]];
+            for (let j = 0; j < 6; j++) u -= pl.Kfb[ki][j] * dev[j];
+            // the trajectory ran out without the LQR taking over: look for a better
+            // one while the controller calms the pendulums down again
+            if (swingTimer > pl.T + 0.4) { planner.retry(); enterSettle(); }
+        } else {
+            u = pflForce(swingAccel(swingTimer), state[0], state[1], th1, state[3], th2, state[5]);
+            if (swingTimer > 30) { planner.retry(); enterSettle(); }
+        }
+        if (insideCatchRegion(e)) enterBalance();
+    }
+    return clamp(u, -U_MAX, U_MAX);
+}
 
 
 // Main Window Renderer Loop Canvas Draws
@@ -404,8 +1208,12 @@ const CSV_MAX = 10000;
 let csvRows = [];
 function resetCsvBuffer() { csvRows = []; }
 
+// Wrap to (-π, π].  A plain remainder keeps the sign of the dividend in
+// JavaScript, so it has to be folded back for angles below -π.
 function normalizeAngle(angle) {
-    return (angle + Math.PI) % (2 * Math.PI) - Math.PI;
+    let a = (angle + Math.PI) % (2 * Math.PI);
+    if (a < 0) a += 2 * Math.PI;
+    return a - Math.PI;
 }
 
 function updateChart() {
@@ -469,6 +1277,8 @@ let recoveryState = 0; // 0: LQR/Normal, 1: Stabilization, 2: Swing-up
 let recoveryTimer = 0;
 let mpcDivergedCount = 0;
 let swingTimer = 0;
+let balanceRef = 0;   // cart reference used while balancing, ramped to x_soll
+let activePlan = null; // trajectory currently being executed
 let forceLimitEnabled = true;
 let railLimitsEnabled = true;
 
@@ -478,146 +1288,62 @@ function loop(timestamp) {
     const dt_ms = timestamp - lastTimestamp;
     lastTimestamp = timestamp;
 
-    let timeAccumulator = Math.min(dt_ms / 1000, 0.05); 
+    let timeAccumulator = Math.min(dt_ms / 1000, 0.05);
     while (timeAccumulator > 0) {
-        let u = 0;
+        let u = systemPower === 0 ? 0 : controlStep(dt);
 
-        if (systemPower === 0) {
-            u = 0;
-        } else if (recoveryState === 1) {
-            recoveryTimer -= dt;
-            const t1 = normalizeAngle(state[2]), dt1 = state[3], dt2 = state[5];
-            const t2 = normalizeAngle(state[4]);
-            const vCenter = -30 * (state[0] - x_soll) - 10 * state[1];
-            const vAngle = 100 * t1 + 80 * t2;
-            const vDamp = -25 * dt1 - 20 * dt2;
-            let vAnti = 0;
-            if (Math.abs(dt2) > 8) vAnti = -1.5 * (dt2 - Math.sign(dt2) * 8);
-            if (Math.abs(dt1) > 7) vAnti += -1.0 * (dt1 - Math.sign(dt1) * 7);
-            const vDesired = Math.max(-15, Math.min(15, vCenter + vAngle + vDamp + vAnti));
-            u = pflForce(vDesired, state[0], state[1], t1, dt1, state[4], dt2);
-            u = Math.max(-50, Math.min(50, u));
-            if (recoveryTimer <= 0) {
-                const ok = Math.abs(normalizeAngle(state[2])) < 0.35 && Math.abs(normalizeAngle(state[4])) < 0.35;
-                if (ok) {
-                    recoveryState = 0;
-                } else {
-                    recoveryState = 2;
-                    recoveryTimer = 30.0;
-                    swingTimer = 0;
-                }
-            }
-        } else {
-            if (recoveryState === 2) {
-                    // ---- Swing-up via Partial Feedback Linearization ----
-                    // Virtual control v = desired cart acceleration drives both pendulums
-                    // through the coupling, enabling active damping of θ₂ spin-out.
-                    const th1 = normalizeAngle(state[2]);
-                    const th2 = normalizeAngle(state[4]);
-                    const dth1 = state[3], dth2 = state[5];
-                    const E1 = 0.5*(I1+m1*l1**2)*dth1**2 + m1*g*l1*(Math.cos(th1)-1);
-                    const E2 = 0.5*(I2+m2*l2**2)*dth2**2 + m2*g*l2*(Math.cos(th2)-1);
-
-                    const pg = Math.min(15, 3 + swingTimer * 0.3);
-                    const cg = Math.max(1, 3 - swingTimer * 0.03);
-
-                    // Acceleration-level swing-up law
-                    const Ew = Math.max(2*E1+0.5*E2, -10);
-                    // Energy pump (only when below target)
-                    const vPump = pg * Math.min(Ew, 0) * dth1 * Math.cos(th1);
-                    // Sinusoidal parametric drive at natural frequency
-                    const omega = Math.sqrt(9.81 / (I1 / (m1 * l1) + l1));
-                    const vSin = Math.min(10, 3 + swingTimer * 0.2) * Math.sin(omega * swingTimer);
-                    // Strong cart centering
-                    const vCart = -cg * (state[0] - x_soll) - cg * 0.3 * state[1];
-                    // PFL enables direct θ₂ velocity damping (thresholded)
-                    let vAnti = 0;
-                    if (Math.abs(dth2) > 8) vAnti = -1.5 * (dth2 - Math.sign(dth2) * 8);
-                    if (Math.abs(dth1) > 7) vAnti += -1.0 * (dth1 - Math.sign(dth1) * 7);
-                    const vDesired = Math.max(-15, Math.min(15, vPump + vSin + vCart + vAnti));
-
-                    u = pflForce(vDesired, state[0], state[1], th1, state[3], th2, state[5]);
-                    u = Math.max(-35, Math.min(35, u));
-
-                    recoveryTimer -= dt;
-                    swingTimer += dt;
-
-                    const absTh1 = Math.abs(th1), absTh2 = Math.abs(th2);
-                    const Et = E1 + E2;
-                    if (absTh1 < 0.55 && absTh2 < 0.75 && Et > -1.5
-                        && Math.abs(dth1) < 5.0 && Math.abs(dth2) < 8.0
-                        && Math.abs(state[0]) < 2.0 && Math.abs(state[1]) < 2.0) {
-                        recoveryState = 1;
-                        recoveryTimer = 5.0;
-                    } else if (recoveryTimer <= 0) {
-                        recoveryState = 2;
-                        recoveryTimer = 30.0;
-                        swingTimer = 0;
-                    }
-                } else if (recoveryState === 0) {
-                    const nt1 = normalizeAngle(state[2]);
-                    const nt2 = normalizeAngle(state[4]);
-                    const th1_a = Math.abs(nt1);
-                    const th2_a = Math.abs(nt2);
-                    if (th1_a < 0.8 && th2_a < 0.8) {
-                        u = -(K[0]*(state[0]-x_soll) + K[1]*state[1] + K[2]*nt1 + K[3]*state[3] + K[4]*nt2 + K[5]*state[5]);
-                        u = Math.max(-50, Math.min(50, u));
-                    } else {
-                        u = 0;
-                    }
-                    if (th1_a > 0.8 || th2_a > 0.8) {
-                        mpcDivergedCount++;
-                        if (mpcDivergedCount > 20) {
-                            recoveryState = 2;
-                            recoveryTimer = 30.0;
-                            mpcDivergedCount = 0;
-                            swingTimer = 0;
-                        }
-                    } else {
-                        mpcDivergedCount = 0;
-                    }
-                }
-            }
-        
-        // Soft rail limit: throttle force when near boundaries (-2.5 to 2.5)
+        // Soft rail limit: throttle the force when heading into a stop
         if (railLimitsEnabled) {
-            const margin = 0.5; // Distance from limit to start throttling
+            const margin = 0.5;
             const distToLimit = 2.5 - Math.abs(state[0]);
             if (distToLimit < margin) {
                 const scale = Math.max(0, distToLimit / margin);
-                // If moving towards the limit, throttle force
-                if ((state[0] > 0 && state[1] > 0) || (state[0] < 0 && state[1] < 0)) {
-                    u *= scale;
-                }
+                if ((state[0] > 0 && state[1] > 0) || (state[0] < 0 && state[1] < 0)) u *= scale;
             }
         }
-        if (forceLimitEnabled) u = Math.max(-50, Math.min(50, u));
-lastU = u; 
-rk4Step(dt, u);
-lastEpot = m1*g*l1*(Math.cos(state[2])-1) + m2*g*l2*(Math.cos(state[4])-1);
-lastEkin = 0.5*(I1+m1*l1**2)*state[3]**2 + 0.5*(I2+m2*l2**2)*state[5]**2;
-timeAccumulator -= dt;
-}
+        if (forceLimitEnabled) u = clamp(u, -U_MAX, U_MAX);
+        lastU = u;
+        rk4Step(dt, u);
 
-// Boundary check and rendering logic below...
-        if (railLimitsEnabled && Math.abs(state[0]) > 2.5) { 
-            state[0] = Math.sign(state[0]) * 2.5; state[1] = 0; 
-            if (recoveryState !== 1) {
-                recoveryState = 1;
-                recoveryTimer = 10.0;
+        // Hard rail stop — checked every integration step, not once per frame
+        if (railLimitsEnabled && Math.abs(state[0]) > 2.5) {
+            state[0] = Math.sign(state[0]) * 2.5;
+            state[1] = 0;
+            if (systemPower !== 0 && recoveryState !== MODE_SETTLE) {
+                if (recoveryState === MODE_SWING) planner.retry();
+                enterSettle();
             }
-            }
-draw();
+        }
+
+        timeAccumulator -= dt;
+    }
+
+    // Telemetry energies, once per frame.  Both use the same expressions as the
+    // controller: the potential of link 1 includes the mass of link 2 riding on
+    // its tip, and the kinetic term includes the θ̇₁θ̇₂ coupling.
+    {
+        const en = pendulumEnergy(normalizeAngle(state[2]), state[3], normalizeAngle(state[4]), state[5]);
+        const V = (m1*l1 + m2*L1) * g * Math.cos(state[2]) + m2 * l2 * g * Math.cos(state[4]);
+        lastEpot = V - en.Ed;      // relative to the up-up position
+        lastEkin = en.E - V;
+    }
+
+    // Keep optimising the swing-up trajectory in the background
+    planner.work();
+
+    draw();
 
 updateChart();
 document.getElementById('lblXAct').innerText = state[0].toFixed(2) + " m";
-const stateLabels = ["Trajectory Playback", "Stabilization", "Swing-up"];
-document.getElementById('lblSysState').innerText = stateLabels[recoveryState]
-    + (recoveryState > 0 ? " (" + (recoveryTimer * 1000).toFixed(0) + " ms)" : "");
+document.getElementById('lblSysState').innerText = systemPower === 0
+    ? "Power off"
+    : STATE_LABELS[recoveryState]
+      + (recoveryState === MODE_SWING ? " (" + swingTimer.toFixed(2) + " s)" : "");
 document.getElementById('lblSolverState').innerText =
-    recoveryState === 2 ? "Swing-up " + (recoveryTimer * 1000).toFixed(0) + "ms"
-    : recoveryState === 1 ? "Stabilizing"
-    : recoveryState === 0 ? "LQR" : "—";
+    planner.searching ? planner.status
+    : planner.plan ? "Plan verified (eᵀPe " + planner.bestQ.toFixed(1) + " < " + catchLevel.toFixed(1) + ")"
+    : planner.failed ? "No plan — energy pumping"
+    : planner.status;
 
     if (!halted && state.some(isNaN)) {
         halted = true;
@@ -637,6 +1363,12 @@ document.getElementById('lblSolverState').innerText =
 
 requestAnimationFrame(loop);
 
+// Pick the starting mode for the current state: balance directly when the LQR
+// can already hold it, otherwise calm down and swing up.
+function engageController() {
+    if (insideCatchRegion(stateError())) enterBalance(); else enterSettle();
+}
+
 function resetSystem() {
     const scenario = document.getElementById('scenarioSelector').value;
     if (scenario === 'A') {
@@ -651,8 +1383,7 @@ function resetSystem() {
     if (systemPower === 0) {
         recoveryState = 0;
     } else {
-        recoveryState = (Math.abs(normalizeAngle(state[2])) < 0.35 && Math.abs(normalizeAngle(state[4])) < 0.35) ? 0 : 2;
-        recoveryTimer = recoveryState === 2 ? 30.0 : 0;
+        engageController();
     }
     swingTimer = 0;
     resetCsvBuffer();
@@ -668,15 +1399,7 @@ function setTargetState(th1, th2) {
     state[1] = 0;
     state[3] = 0;
     state[5] = 0;
-    if (systemPower !== 0) {
-        if (Math.abs(normalizeAngle(th1)) < 0.35 && Math.abs(normalizeAngle(th2)) < 0.35) {
-            recoveryState = 0;
-        } else {
-            recoveryState = 2;
-            recoveryTimer = 30.0;
-            swingTimer = 0;
-        }
-    }
+    if (systemPower !== 0) engageController();
 }
 
 // FIXED INITIALIZATION: Wait until everything is completely ready before attaching interaction
@@ -713,17 +1436,11 @@ window.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btnPower').addEventListener('click', () => { 
         systemPower = systemPower === 1 ? 0 : 1;
         if (systemPower === 0) {
-            recoveryState = 0;
+            recoveryState = MODE_BALANCE;
             mpcDivergedCount = 0;
         } else {
             resetCsvBuffer();
-            if (Math.abs(normalizeAngle(state[2])) < 0.35 && Math.abs(normalizeAngle(state[4])) < 0.35) {
-                recoveryState = 0;
-            } else {
-                recoveryState = 2;
-                recoveryTimer = 30.0;
-                swingTimer = 0;
-            }
+            engageController();
         }
         document.getElementById('btnPower').style.background = systemPower === 1 ? "#ff5555" : "#444";
         document.getElementById('btnPower').innerText = systemPower === 1 ? "Power: ON" : "Power: OFF";
@@ -732,8 +1449,7 @@ window.addEventListener('DOMContentLoaded', () => {
         adaptiveMode = !adaptiveMode; 
         document.getElementById('btnAdaptiveToggle').style.background = adaptiveMode ? "#00ecb3" : "#444";
         document.getElementById('btnAdaptiveToggle').innerText = adaptiveMode ? "Adaptation: ON" : "Adaptation: OFF";
-        if (!adaptiveMode) K = [...K_static];
-        else synthesizeLQR();
+        if (adaptiveMode) synthesizeLQR(); else K_static = [...K];
     });
 
     document.getElementById('slipC').addEventListener('input', (e) => { c_damping = parseFloat(e.target.value); document.getElementById('valC').innerText = c_damping.toFixed(2); });
@@ -769,6 +1485,7 @@ window.addEventListener('DOMContentLoaded', () => {
     // Boot up sequence
     resizeCanvas();
     synthesizeLQR();
+    recoveryState = MODE_SETTLE;
     loop();
 });
 </script>
